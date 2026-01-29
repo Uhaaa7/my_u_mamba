@@ -1,3 +1,14 @@
+# --- Project Specific - Dataset and Results ---
+# 既然结果和预测图都在 data 里，直接忽略整个文件夹
+data/
+
+# 常见的训练输出文件夹 (如果你的项目会自动生成这些，也建议加上)
+work_dirs/
+runs/
+snapshots/
+checkpoints/
+
+# --- Standard Python ---
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -25,8 +36,6 @@ var/
 *.egg
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -49,15 +58,11 @@ coverage.xml
 *.mo
 *.pot
 
-# Django stuff:
+# Django/Flask stuff:
 *.log
 local_settings.py
-
-# Flask stuff:
 instance/
 .webassets-cache
-
-# Scrapy stuff:
 .scrapy
 
 # Sphinx documentation
@@ -82,34 +87,34 @@ celerybeat-schedule
 venv/
 ENV/
 
-# Spyder project settings
+# IDE settings
 .spyderproject
-
-# Rope project settings
 .ropeproject
+.idea
+.idea/*
+.vscode/
 
-*.memmap
-*.png
+# --- Large Files & Weights (Strictly Ignore) ---
+# 忽略压缩包
 *.zip
+*.tar
+*.tar.gz
+
+# 忽略 Numpy 大数据文件
+*.memmap
 *.npz
 *.npy
-*.jpg
-*.jpeg
-.idea
-*.txt
-.idea/*
-*.png
+*.pkl
+
+# 忽略医学影像格式 (防止有漏网之鱼不在 data 文件夹里)
 *.nii.gz
 *.nii
 *.tif
-*.bmp
-*.pkl
-*.xml
-*.pkl
-*.pdf
-*.png
-*.jpg
-*.jpeg
+*.dcm
 
+# 忽略模型权重文件 (非常重要，防止上传几个G的模型)
 *.model
-
+*.pth
+*.pt
+*.ckpt
+*.weights
