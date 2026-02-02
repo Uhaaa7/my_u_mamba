@@ -1,3 +1,8 @@
+try:
+    from .sdg_block import SDG_Block
+except ImportError:
+    from sdg_block import SDG_Block
+
 import numpy as np
 import math
 import torch
@@ -269,6 +274,9 @@ class UNetResDecoder(nn.Module):
         self.encoder = encoder
         self.num_classes = num_classes
         n_stages_encoder = len(encoder.output_channels)
+        # === 【新增】初始化模块列表 ===
+        self.sdg_blocks = nn.ModuleList()
+        # ===========================
         if isinstance(n_conv_per_stage, int):
             n_conv_per_stage = [n_conv_per_stage] * (n_stages_encoder - 1)
         assert len(n_conv_per_stage) == n_stages_encoder - 1, "n_conv_per_stage must have as many entries as we have " \
@@ -332,7 +340,15 @@ class UNetResDecoder(nn.Module):
         for s in range(len(self.stages)):
             x = self.upsample_layers[s](lres_input)
             if s < (len(self.stages) - 1):
-                x = torch.cat((x, skips[-(s+2)]), 1)
+                # 1. 取出原始的 skip 特征
+                skip_feature = skips[-(s+2)]
+                
+                # 2. 让它先通过我们的 SDG-Block (DCN + H-SS2D)
+                # s 对应当前第几层 Decoder，正好对应我们 append 的顺序
+                skip_feature = self.sdg_blocks[s](skip_feature)
+                
+                # 3. 拼接处理后的特征
+                x = torch.cat((x, skip_feature), 1)
             x = self.stages[s](x)
             if self.deep_supervision:
                 seg_outputs.append(self.seg_layers[s](x))
