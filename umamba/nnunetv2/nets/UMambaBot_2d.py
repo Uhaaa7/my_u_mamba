@@ -290,6 +290,7 @@ class UNetResDecoder(nn.Module):
         for s in range(1, n_stages_encoder):
             input_features_below = encoder.output_channels[-s]
             input_features_skip = encoder.output_channels[-(s + 1)]
+            self.sdg_blocks.append(SDG_Block(dim=input_features_skip))
             stride_for_upsampling = encoder.strides[-s]
             upsample_layers.append(UpsampleLayer(
                 conv_op = encoder.conv_op,

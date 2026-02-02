@@ -7,7 +7,10 @@ import os
 import sys
 import torch.fft
 import math
-from .vmamba import SS2D
+try:
+    from .vmamba import SS2D
+except ImportError:
+    from vmamba import SS2D
 
 import traceback
 
