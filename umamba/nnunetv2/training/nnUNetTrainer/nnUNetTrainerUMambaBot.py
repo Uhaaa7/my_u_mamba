@@ -15,7 +15,7 @@ class nnUNetTrainerUMambaBot(nnUNetTrainer):
 
         if len(configuration_manager.patch_size) == 2:
             model = get_umamba_bot_2d_from_plans(plans_manager, dataset_json, configuration_manager,
-                                          num_input_channels, deep_supervision=enable_deep_supervision)
+                                          num_input_channels, deep_supervision=enable_deep_supervision, enable_sdg=False)
         elif len(configuration_manager.patch_size) == 3:
             model = get_umamba_bot_3d_from_plans(plans_manager, dataset_json, configuration_manager,
                                           num_input_channels, deep_supervision=enable_deep_supervision)
@@ -23,5 +23,6 @@ class nnUNetTrainerUMambaBot(nnUNetTrainer):
             raise NotImplementedError("Only 2D and 3D models are supported")
         
         print("UMambaBot: {}".format(model))
+        print("🚀 [Baseline Mode] UMambaBot (SDG Disabled) initialized successfully.")
 
         return model

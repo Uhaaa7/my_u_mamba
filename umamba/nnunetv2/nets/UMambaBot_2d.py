@@ -267,7 +267,7 @@ class UNetResDecoder(nn.Module):
                  encoder,
                  num_classes,
                  n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
-                 deep_supervision, nonlin_first: bool = False):
+                 deep_supervision, nonlin_first: bool = False, enable_sdg: bool = False):
 
         super().__init__()
         self.deep_supervision = deep_supervision
@@ -287,10 +287,27 @@ class UNetResDecoder(nn.Module):
         upsample_layers = []
 
         seg_layers = []
+        # 新代码：只给深层加，跳过最高分辨率层
+        # n_stages_encoder 通常是 6 左右。s=1 是最深层，s越大越浅。
+        # 我们希望当 s 达到最后一层时，不要加 SDG-Block
+        
         for s in range(1, n_stages_encoder):
             input_features_below = encoder.output_channels[-s]
             input_features_skip = encoder.output_channels[-(s + 1)]
-            self.sdg_blocks.append(SDG_Block(dim=input_features_skip))
+            
+            # === 【修改开始】 ===
+            # 如果不是最后一层（最高分辨率层），才加 SDG-Block
+            if enable_sdg:
+                if s < (n_stages_encoder - 1): 
+                    self.sdg_blocks.append(SDG_Block(dim=input_features_skip))
+                else:
+                    # 最后一层给个占位符，或者什么都不做（但 forward 里要对应修改）
+                    # 为了简单，我们存一个 nn.Identity()，这样 forward 代码不用大改
+                    self.sdg_blocks.append(nn.Identity()) 
+            else:
+                self.sdg_blocks.append(nn.Identity())
+            # === 【修改结束】 ===
+
             stride_for_upsampling = encoder.strides[-s]
             upsample_layers.append(UpsampleLayer(
                 conv_op = encoder.conv_op,
@@ -400,9 +417,13 @@ class UMambaBot(nn.Module):
                  nonlin: Union[None, Type[torch.nn.Module]] = None,
                  nonlin_kwargs: dict = None,
                  deep_supervision: bool = False,
-                 stem_channels: int = None
+                 stem_channels: int = None, 
+                 enable_sdg: bool = False
                  ):
         super().__init__()
+        print("\n" + "="*50)
+        print("🚀🚀🚀 恭喜！你正在运行修改后的新代码 (Scheme B)！🚀🚀🚀")
+        print("="*50 + "\n")
         n_blocks_per_stage = n_conv_per_stage
         if isinstance(n_blocks_per_stage, int):
             n_blocks_per_stage = [n_blocks_per_stage] * n_stages
@@ -437,12 +458,12 @@ class UMambaBot(nn.Module):
             nonlin,
             nonlin_kwargs,
             return_skips=True,
-            stem_channels=stem_channels
+            stem_channels=stem_channels,
         )
 
         self.mamba_layer = MambaLayer(dim = features_per_stage[-1])
 
-        self.decoder = UNetResDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision)
+        self.decoder = UNetResDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision, enable_sdg=enable_sdg)
 
     def forward(self, x):
         skips = self.encoder(x)
@@ -461,7 +482,8 @@ def get_umamba_bot_2d_from_plans(
         dataset_json: dict,
         configuration_manager: ConfigurationManager,
         num_input_channels: int,
-        deep_supervision: bool = True
+        deep_supervision: bool = True,
+        enable_sdg: bool = False
     ):
     """
     we may have to change this in the future to accommodate other plans -> network mappings
@@ -503,6 +525,7 @@ def get_umamba_bot_2d_from_plans(
         strides=configuration_manager.pool_op_kernel_sizes,
         num_classes=label_manager.num_segmentation_heads,
         deep_supervision=deep_supervision,
+        enable_sdg=enable_sdg,
         **conv_or_blocks_per_stage,
         **kwargs[segmentation_network_class_name]
     )
