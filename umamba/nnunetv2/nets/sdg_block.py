@@ -3,11 +3,11 @@ import torch.nn as nn
 from timm.models.layers import DropPath
 import math
 import torchvision.ops
-# 👇👇👇 补上了这一行！没有它会报错！ 👇👇👇
+# 必须显式导入 checkpoint
 from torch.utils.checkpoint import checkpoint 
 
 # ==========================================
-# 修复后的导入逻辑：不再隐藏报错
+# 导入逻辑：确保能找到 H_vmunet
 # ==========================================
 try:
     # 尝试相对导入 (用于 nnU-Net 训练时)
@@ -17,7 +17,6 @@ except ImportError as e:
         # 尝试绝对导入 (用于单独 python test_model.py 测试时)
         from H_vmunet import H_SS2D
     except ImportError as e2:
-        # 如果两次都失败，打印详细错误并抛出异常
         print(f"❌ 严重错误: 无法导入 H_vmunet.H_SS2D")
         print(f"   相对导入错误: {e}")
         print(f"   绝对导入错误: {e2}")
@@ -91,7 +90,7 @@ class SDG_Block(nn.Module):
         super().__init__()
         self.dcn = DCNv2_PyTorch(in_channels=dim, out_channels=dim, kernel_size=3, stride=1, padding=1)
         
-        # 初始化 H-SS2D (已经确保导入成功)
+        # 初始化 H-SS2D
         max_possible_order = int(math.log2(dim)) - 1
         safe_order = min(5, max(2, max_possible_order))
         self.h_ss2d = H_SS2D(dim=dim, order=safe_order, s=1.0)
@@ -100,26 +99,32 @@ class SDG_Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
-        # 1. 把计算逻辑封装进函数 (为了传给 checkpoint)
-        def _inner_forward(input_x):
-            shortcut = input_x
-            x = self.dcn(input_x)
+        # 🔥🔥🔥 【核心修改】 强制进入 FP32 模式 🔥🔥🔥
+        # 即使外部 nnU-Net 开了 AMP (FP16)，这个模块内部也会强制用 float32 计算
+        # 这是为了防止 DCN 和 Mamba 产生数值溢出 (NaN)
+        with torch.autocast(device_type='cuda', enabled=False):
+            x = x.float()  # 必须显式把输入转为 float32
             
-            # 维度转换 NCHW -> NHWC (LayerNorm 需要)
-            x = x.permute(0, 2, 3, 1).contiguous()
-            x = self.norm(x)
-            
-            # 维度转换 NHWC -> NCHW (SS2D 需要)
-            x = x.permute(0, 3, 1, 2).contiguous()
-            x = self.h_ss2d(x)
-            
-            # 残差连接
-            x = shortcut + self.drop_path(x)
-            return x
+            # 1. 内部计算逻辑 (完全在 float32 下运行)
+            def _inner_forward(input_x):
+                shortcut = input_x
+                x = self.dcn(input_x)
+                
+                # 维度转换 NCHW -> NHWC (LayerNorm 需要)
+                x = x.permute(0, 2, 3, 1).contiguous()
+                x = self.norm(x)
+                
+                # 维度转换 NHWC -> NCHW (SS2D 需要)
+                x = x.permute(0, 3, 1, 2).contiguous()
+                x = self.h_ss2d(x)
+                
+                # 残差连接
+                x = shortcut + self.drop_path(x)
+                return x
 
-        # 2. 训练时启用 checkpoint 省显存
-        # 只有在训练模式且需要梯度时才开启，验证/测试时不开启
-        if self.training and x.requires_grad:
-            return checkpoint(_inner_forward, x, use_reentrant=False)
-        else:
-            return _inner_forward(x)
+            # 2. 训练时启用 checkpoint 省显存
+            # Checkpoint 会自动处理这里的 float32 状态
+            if self.training and x.requires_grad:
+                return checkpoint(_inner_forward, x, use_reentrant=False)
+            else:
+                return _inner_forward(x)
