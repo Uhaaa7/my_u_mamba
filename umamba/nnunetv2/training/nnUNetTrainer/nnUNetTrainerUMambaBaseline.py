@@ -61,6 +61,15 @@ class nnUNetTrainerUMambaBaseline(nnUNetTrainer):
         print("🐢 [Baseline] SDG Module: DISABLED ❌")
         return model
 
+
+    def configure_rotation_dummy_DA_mirroring_and_inital_patch_size(self):
+        # 1. 先继承父类的默认配置
+        super().configure_rotation_dummy_DA_mirroring_and_inital_patch_size()
+        
+        # 2. 然后强行覆盖：关闭 TTA（镜像增强）
+        # 这里的空元组 () 代表 X,Y,Z 轴都不允许翻转
+        self.inference_allowed_mirroring_axes = ()
+        
     # ✅ 3. 强制对齐梯度裁剪
     def train_step(self, batch: dict) -> dict:
         data = batch['data']

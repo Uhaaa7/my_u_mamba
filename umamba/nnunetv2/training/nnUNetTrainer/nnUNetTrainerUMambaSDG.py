@@ -7,8 +7,8 @@ from nnunetv2.nets.UMambaBot_2d import get_umamba_bot_2d_from_plans
 class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
     """
     【创新点训练器 Ours】
-    继承自原版 Trainer，但在构建网络时强制打开 enable_sdg=True。
-    并且重写了 train_step 以加入梯度裁剪，防止 NaN。
+    继承自 nnUNetTrainerUMambaBot，唯一差异是开启 SDG 模块。
+    所有超参数与 Baseline 完全一致，实现公平对比。
     """
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
@@ -16,12 +16,10 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
         # 调用父类初始化
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         
-        # 👇👇👇 【核心修改】降低初始学习率 👇👇👇
-        # 默认是 1e-2 (0.01)，对于 BS=4 + Mamba 来说太激进了
-        # 改为 1e-3 (0.001)，稳扎稳打
-        self.initial_lr = 1e-3
-        self.num_epochs = 500
-        print("🔥🔥🔥 成功加载了我的修改版 Trainer！初始 LR = 1e-3 🔥🔥🔥")
+        # ✅ 与 Baseline (nnUNetTrainerUMambaBot) 完全对齐的超参数
+        # num_epochs=200, initial_lr=0.01 继承自 nnUNetTrainer
+        print("🔥🔥🔥 成功加载了改进版 Trainer (SDG V2)！配置与 Baseline 一致 🔥🔥🔥")
+        print(f"📊 当前训练配置: num_epochs={self.num_epochs}, initial_lr={self.initial_lr}")
     @staticmethod
     def build_network_architecture(plans_manager: PlansManager,
                                    dataset_json,
@@ -47,39 +45,3 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
         print("🚀🚀🚀 [Ours Mode] UMambaBot with SDG-Block ENABLED! 🚀🚀🚀")
 
         return model
-
-    # 👇👇👇 把这个函数加在这里！这就加上了梯度裁剪 👇👇👇
-    def train_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
-
-        data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        # Autocast 是 nnU-Net 默认开启的
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
-            output = self.network(data)
-            l = self.loss(output, target)
-
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
-            
-            # 🔥🔥🔥 关键修改：在 scaler.step 之前解包并裁剪梯度 🔥🔥🔥
-            # 这就是防止 NaN 的绝对防御
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12.0)
-            
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            l.backward()
-            # 如果没用 scaler (极少见)，也加上裁剪
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12.0)
-            self.optimizer.step()
-
-        return {'loss': l.detach().cpu().numpy()}

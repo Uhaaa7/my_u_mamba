@@ -1,7 +1,7 @@
 try:
-    from .sdg_block import SDG_Block
+    from .mia_ss2d import MIA_SS2D_Block as SDG_Block
 except ImportError:
-    from sdg_block import SDG_Block
+    from mia_ss2d import MIA_SS2D_Block as SDG_Block
 
 import numpy as np
 import math
