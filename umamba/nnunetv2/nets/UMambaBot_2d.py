@@ -1,14 +1,14 @@
 try:
-    from .mia_ss2d import MIA_SS2D_Block as SDG_Block
+    from .mia_ss2d import MIA_SS2D_Block as SDG_Block, VALID_MODES
 except ImportError:
-    from mia_ss2d import MIA_SS2D_Block as SDG_Block
+    from mia_ss2d import MIA_SS2D_Block as SDG_Block, VALID_MODES
 
 import numpy as np
 import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from typing import Union, Type, List, Tuple
+from typing import Union, Type, List, Tuple, Optional
 
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
@@ -21,6 +21,7 @@ from mamba_ssm import Mamba
 from dynamic_network_architectures.building_blocks.helper import maybe_convert_scalar_to_list, get_matching_pool_op
 from torch.cuda.amp import autocast
 from dynamic_network_architectures.building_blocks.residual import BasicBlockD
+
 
 class UpsampleLayer(nn.Module):
     def __init__(
@@ -41,16 +42,17 @@ class UpsampleLayer(nn.Module):
         x = self.conv(x)
         return x
 
+
 class MambaLayer(nn.Module):
-    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
         self.mamba = Mamba(
-                d_model=dim, # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
+                d_model=dim,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
         )
     
     @autocast(enabled=False)
@@ -65,7 +67,6 @@ class MambaLayer(nn.Module):
         x_norm = self.norm(x_flat)
         x_mamba = self.mamba(x_norm)
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
-
         return out
 
 
@@ -107,7 +108,8 @@ class BasicResBlock(nn.Module):
             x = self.conv3(x)
         y += x
         return self.act2(y)
-    
+
+
 class UNetResEncoder(nn.Module):
     def __init__(self,
                  input_channels: int,
@@ -136,14 +138,10 @@ class UNetResEncoder(nn.Module):
         if isinstance(strides, int):
             strides = [strides] * n_stages
 
-        assert len(
-            kernel_sizes) == n_stages, "kernel_sizes must have as many entries as we have resolution stages (n_stages)"
-        assert len(
-            n_blocks_per_stage) == n_stages, "n_conv_per_stage must have as many entries as we have resolution stages (n_stages)"
-        assert len(
-            features_per_stage) == n_stages, "features_per_stage must have as many entries as we have resolution stages (n_stages)"
-        assert len(strides) == n_stages, "strides must have as many entries as we have resolution stages (n_stages). " \
-                                         "Important: first entry is recommended to be 1, else we run strided conv drectly on the input"
+        assert len(kernel_sizes) == n_stages
+        assert len(n_blocks_per_stage) == n_stages
+        assert len(features_per_stage) == n_stages
+        assert len(strides) == n_stages
 
         pool_op = get_matching_pool_op(conv_op, pool_type=pool_type) if pool_type != 'conv' else None
 
@@ -155,9 +153,9 @@ class UNetResEncoder(nn.Module):
 
         self.stem = nn.Sequential(
             BasicResBlock(
-                conv_op = conv_op,
-                input_channels = input_channels,
-                output_channels = stem_channels,
+                conv_op=conv_op,
+                input_channels=input_channels,
+                output_channels=stem_channels,
                 norm_op=norm_op,
                 norm_op_kwargs=norm_op_kwargs,
                 kernel_size=kernel_sizes[0],
@@ -169,52 +167,50 @@ class UNetResEncoder(nn.Module):
             ), 
             *[
                 BasicBlockD(
-                    conv_op = conv_op,
-                    input_channels = stem_channels,
-                    output_channels = stem_channels,
-                    kernel_size = kernel_sizes[0],
-                    stride = 1,
-                    conv_bias = conv_bias,
-                    norm_op = norm_op,
-                    norm_op_kwargs = norm_op_kwargs,
-                    nonlin = nonlin,
-                    nonlin_kwargs = nonlin_kwargs,
+                    conv_op=conv_op,
+                    input_channels=stem_channels,
+                    output_channels=stem_channels,
+                    kernel_size=kernel_sizes[0],
+                    stride=1,
+                    conv_bias=conv_bias,
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
                 ) for _ in range(n_blocks_per_stage[0] - 1)
             ]
         )
 
-
         input_channels = stem_channels
 
-        # now build the network
         stages = []
         for s in range(n_stages):
             stage = nn.Sequential(
                 BasicResBlock(
-                    conv_op = conv_op,
-                    norm_op = norm_op,
-                    norm_op_kwargs = norm_op_kwargs,
-                    input_channels = input_channels,
-                    output_channels = features_per_stage[s],
-                    kernel_size = kernel_sizes[s],
+                    conv_op=conv_op,
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    input_channels=input_channels,
+                    output_channels=features_per_stage[s],
+                    kernel_size=kernel_sizes[s],
                     padding=self.conv_pad_sizes[s],
                     stride=strides[s],
                     use_1x1conv=True,
-                    nonlin = nonlin,
-                    nonlin_kwargs = nonlin_kwargs
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs
                 ),
                 *[
                     BasicBlockD(
-                        conv_op = conv_op,
-                        input_channels = features_per_stage[s],
-                        output_channels = features_per_stage[s],
-                        kernel_size = kernel_sizes[s],
-                        stride = 1,
-                        conv_bias = conv_bias,
-                        norm_op = norm_op,
-                        norm_op_kwargs = norm_op_kwargs,
-                        nonlin = nonlin,
-                        nonlin_kwargs = nonlin_kwargs,
+                        conv_op=conv_op,
+                        input_channels=features_per_stage[s],
+                        output_channels=features_per_stage[s],
+                        kernel_size=kernel_sizes[s],
+                        stride=1,
+                        conv_bias=conv_bias,
+                        norm_op=norm_op,
+                        norm_op_kwargs=norm_op_kwargs,
+                        nonlin=nonlin,
+                        nonlin_kwargs=nonlin_kwargs,
                     ) for _ in range(n_blocks_per_stage[s] - 1)
                 ]
             )
@@ -232,8 +228,6 @@ class UNetResEncoder(nn.Module):
         self.norm_op_kwargs = norm_op_kwargs
         self.nonlin = nonlin
         self.nonlin_kwargs = nonlin_kwargs
-        #self.dropout_op = dropout_op
-        #self.dropout_op_kwargs = dropout_op_kwargs
         self.conv_bias = conv_bias
         self.kernel_sizes = kernel_sizes
 
@@ -262,88 +256,148 @@ class UNetResEncoder(nn.Module):
         return output
 
 
+class LightAuxiliaryHead(nn.Module):
+    """
+    轻量辅助分割头
+    
+    设计原则:
+    - 极简结构：仅一个 1x1 卷积 + 上采样
+    - 不引入额外复杂分支
+    - 用于训练期辅助监督
+    """
+    def __init__(self, in_channels, num_classes, target_size=None):
+        super().__init__()
+        self.target_size = target_size
+        self.conv = nn.Conv2d(in_channels, num_classes, kernel_size=1, bias=True)
+        
+    def forward(self, x, target_size=None):
+        out = self.conv(x)
+        
+        if target_size is not None:
+            out = F.interpolate(out, size=target_size, mode='bilinear', align_corners=False)
+        elif self.target_size is not None:
+            out = F.interpolate(out, size=self.target_size, mode='bilinear', align_corners=False)
+            
+        return out
+    
+    def compute_conv_feature_map_size(self, input_size):
+        # 1x1 卷积的特征图大小
+        return np.prod([self.conv.out_channels, *input_size], dtype=np.int64)
+
+
 class UNetResDecoder(nn.Module):
+    """
+    UNet 解码器
+    
+    本次修改:
+    1. 分层异构配置: 不同 skip 层使用不同模式 (full / light / identity)
+    2. 支持轻量 auxiliary head
+    3. 修复: skip_modes 只配置实际使用的 skip 层 (n_stages_decoder - 1 层)
+    4. 添加健壮性检查
+    """
     def __init__(self,
                  encoder,
                  num_classes,
                  n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
-                 deep_supervision, nonlin_first: bool = False, enable_sdg: bool = False):
+                 deep_supervision, 
+                 nonlin_first: bool = False, 
+                 enable_sdg: bool = False,
+                 skip_modes: Optional[List[str]] = None,
+                 enable_aux_head: bool = False,
+                 aux_head_stage: int = 1):
 
         super().__init__()
         self.deep_supervision = deep_supervision
         self.encoder = encoder
         self.num_classes = num_classes
+        self.enable_aux_head = enable_aux_head
+        self.aux_head_stage = aux_head_stage
+        
         n_stages_encoder = len(encoder.output_channels)
-        # === 【新增】初始化模块列表 ===
+        n_stages_decoder = n_stages_encoder - 1
+        
+        # === 分层异构配置 ===
+        # 修复: skip_modes 只配置实际使用的 skip 层
+        # 在 forward 中，只有 s < (len(self.stages) - 1) 时才使用 skip
+        # 所以实际使用的 skip 层数 = n_stages_decoder - 1
+        
+        n_used_skips = n_stages_decoder - 1  # 实际使用的 skip 层数
+        
+        if skip_modes is None:
+            skip_modes = self._get_default_skip_modes(n_used_skips)
+        
+        # 健壮性检查: skip_modes 长度必须与实际使用的 skip 层数匹配
+        assert len(skip_modes) == n_used_skips, \
+            f"skip_modes length ({len(skip_modes)}) must match number of used skips ({n_used_skips})"
+        
+        # 健壮性检查: 所有 mode 必须合法
+        for i, mode in enumerate(skip_modes):
+            assert mode in VALID_MODES, \
+                f"skip_modes[{i}] = '{mode}' is invalid, must be one of {VALID_MODES}"
+        
+        self.skip_modes = skip_modes
+        print(f"📋 Skip connection modes (for {n_used_skips} used skips): {skip_modes}")
+        
         self.sdg_blocks = nn.ModuleList()
-        # ===========================
+        
         if isinstance(n_conv_per_stage, int):
-            n_conv_per_stage = [n_conv_per_stage] * (n_stages_encoder - 1)
-        assert len(n_conv_per_stage) == n_stages_encoder - 1, "n_conv_per_stage must have as many entries as we have " \
-                                                          "resolution stages - 1 (n_stages in encoder - 1), " \
-                                                          "here: %d" % n_stages_encoder
+            n_conv_per_stage = [n_conv_per_stage] * n_stages_decoder
+        assert len(n_conv_per_stage) == n_stages_decoder
 
         stages = []
         upsample_layers = []
-
         seg_layers = []
-        # 新代码：只给深层加，跳过最高分辨率层
-        # n_stages_encoder 通常是 6 左右。s=1 是最深层，s越大越浅。
-        # 我们希望当 s 达到最后一层时，不要加 SDG-Block
-        
-        for s in range(1, n_stages_encoder):
-            input_features_below = encoder.output_channels[-s]
-            input_features_skip = encoder.output_channels[-(s + 1)]
-            
-            # === 【修改开始】 ===
-            # 如果不是最后一层（最高分辨率层），才加 SDG-Block
-            if enable_sdg:
-                if s < (n_stages_encoder - 1): 
-                    self.sdg_blocks.append(SDG_Block(dim=input_features_skip))
-                else:
-                    # 最后一层给个占位符，或者什么都不做（但 forward 里要对应修改）
-                    # 为了简单，我们存一个 nn.Identity()，这样 forward 代码不用大改
-                    self.sdg_blocks.append(nn.Identity()) 
-            else:
-                self.sdg_blocks.append(nn.Identity())
-            # === 【修改结束】 ===
 
-            stride_for_upsampling = encoder.strides[-s]
+        for s in range(n_stages_decoder):
+            input_features_below = encoder.output_channels[-(s + 1)]
+            input_features_skip = encoder.output_channels[-(s + 2)]
+            
+            # === 根据 skip_modes 配置 SDG 模块 ===
+            # 只有 s < n_used_skips 时才需要 SDG 模块
+            if s < n_used_skips:
+                mode = skip_modes[s]
+                if enable_sdg and mode != 'identity':
+                    self.sdg_blocks.append(SDG_Block(dim=input_features_skip, mode=mode))
+                else:
+                    self.sdg_blocks.append(nn.Identity())
+            # 最后一个 stage 不使用 skip，不需要 SDG 模块
+
+            stride_for_upsampling = encoder.strides[-(s + 1)]
             upsample_layers.append(UpsampleLayer(
-                conv_op = encoder.conv_op,
-                input_channels = input_features_below,
-                output_channels = input_features_skip,
-                pool_op_kernel_size = stride_for_upsampling,
+                conv_op=encoder.conv_op,
+                input_channels=input_features_below,
+                output_channels=input_features_skip,
+                pool_op_kernel_size=stride_for_upsampling,
                 mode='nearest'
             ))
 
             stages.append(nn.Sequential(
                 BasicResBlock(
-                    conv_op = encoder.conv_op,
-                    norm_op = encoder.norm_op,
-                    norm_op_kwargs = encoder.norm_op_kwargs,
-                    nonlin = encoder.nonlin,
-                    nonlin_kwargs = encoder.nonlin_kwargs,
-                    input_channels = 2 * input_features_skip if s < n_stages_encoder - 1 else input_features_skip,
-                    output_channels = input_features_skip,
-                    kernel_size = encoder.kernel_sizes[-(s + 1)],
-                    padding=encoder.conv_pad_sizes[-(s + 1)],
+                    conv_op=encoder.conv_op,
+                    norm_op=encoder.norm_op,
+                    norm_op_kwargs=encoder.norm_op_kwargs,
+                    nonlin=encoder.nonlin,
+                    nonlin_kwargs=encoder.nonlin_kwargs,
+                    input_channels=2 * input_features_skip if s < n_stages_decoder - 1 else input_features_skip,
+                    output_channels=input_features_skip,
+                    kernel_size=encoder.kernel_sizes[-(s + 2)],
+                    padding=encoder.conv_pad_sizes[-(s + 2)],
                     stride=1,
                     use_1x1conv=True
                 ),
                 *[
                     BasicBlockD(
-                        conv_op = encoder.conv_op,
-                        input_channels = input_features_skip,
-                        output_channels = input_features_skip,
-                        kernel_size = encoder.kernel_sizes[-(s + 1)],
-                        stride = 1,
-                        conv_bias = encoder.conv_bias,
-                        norm_op = encoder.norm_op,
-                        norm_op_kwargs = encoder.norm_op_kwargs,
-                        nonlin = encoder.nonlin,
-                        nonlin_kwargs = encoder.nonlin_kwargs,
-                    ) for _ in range(n_conv_per_stage[s-1] - 1)
+                        conv_op=encoder.conv_op,
+                        input_channels=input_features_skip,
+                        output_channels=input_features_skip,
+                        kernel_size=encoder.kernel_sizes[-(s + 2)],
+                        stride=1,
+                        conv_bias=encoder.conv_bias,
+                        norm_op=encoder.norm_op,
+                        norm_op_kwargs=encoder.norm_op_kwargs,
+                        nonlin=encoder.nonlin,
+                        nonlin_kwargs=encoder.nonlin_kwargs,
+                    ) for _ in range(n_conv_per_stage[s] - 1)
                 ]
             ))
             seg_layers.append(encoder.conv_op(input_features_skip, num_classes, 1, 1, 0, bias=True))
@@ -351,36 +405,103 @@ class UNetResDecoder(nn.Module):
         self.stages = nn.ModuleList(stages)
         self.upsample_layers = nn.ModuleList(upsample_layers)
         self.seg_layers = nn.ModuleList(seg_layers)
+        
+        # === 轻量 Auxiliary Head ===
+        if enable_aux_head:
+            # aux_head_stage 指定从哪个 decoder stage 接入
+            # aux_head_stage=0 表示最深层，aux_head_stage=n_stages_decoder-1 表示最浅层
+            # 默认选择中间偏上的层 (aux_head_stage=1)
+            aux_stage_idx = min(aux_head_stage, n_stages_decoder - 1)
+            aux_channels = encoder.output_channels[-(aux_stage_idx + 2)]
+            self.aux_head = LightAuxiliaryHead(
+                in_channels=aux_channels,
+                num_classes=num_classes
+            )
+            self.aux_stage_idx = aux_stage_idx
+            print(f"🔧 Auxiliary head enabled at decoder stage {aux_stage_idx} (channels={aux_channels})")
+        else:
+            self.aux_head = None
+            self.aux_stage_idx = -1
 
-    def forward(self, skips):
+    def _get_default_skip_modes(self, n_used_skips):
+        """
+        获取默认的分层异构配置
+        
+        策略 (针对实际使用的 skip 层):
+        - 最深层 (s=0): light - 语义强但空间粗，使用轻量模式
+        - 中间层 (s=1, s=2, ...): full - 最适合跳跃连接重构
+        - 最高分辨率层 (s=n-1): identity - 细节丰富，不做重增强
+        
+        例如 n_used_skips=4 时:
+        skip_modes = ['light', 'full', 'full', 'identity']
+        """
+        if n_used_skips <= 1:
+            return ['light']
+        
+        if n_used_skips == 2:
+            return ['light', 'identity']
+        
+        modes = []
+        for s in range(n_used_skips):
+            if s == 0:
+                modes.append('light')
+            elif s == n_used_skips - 1:
+                modes.append('identity')
+            else:
+                modes.append('full')
+        
+        return modes
+
+    def forward(self, skips, input_size=None):
+        """
+        Args:
+            skips: encoder 输出的 skip 特征列表
+            input_size: 原始输入尺寸，用于 auxiliary head 上采样
+        
+        Returns:
+            如果 enable_aux_head=False: 返回主分割输出 (与之前一致)
+            如果 enable_aux_head=True: 返回 (主输出, aux输出) 或 [主输出列表, aux输出]
+        """
         lres_input = skips[-1]
         seg_outputs = []
+        aux_output = None
+        
+        n_used_skips = len(self.skip_modes)
+        
         for s in range(len(self.stages)):
             x = self.upsample_layers[s](lres_input)
-            if s < (len(self.stages) - 1):
-                # 1. 取出原始的 skip 特征
-                skip_feature = skips[-(s+2)]
-                
-                # 2. 让它先通过我们的 SDG-Block (DCN + H-SS2D)
-                # s 对应当前第几层 Decoder，正好对应我们 append 的顺序
+            
+            if s < n_used_skips:
+                skip_feature = skips[-(s + 2)]
                 skip_feature = self.sdg_blocks[s](skip_feature)
-                
-                # 3. 拼接处理后的特征
                 x = torch.cat((x, skip_feature), 1)
+            
             x = self.stages[s](x)
+            
+            # === Auxiliary Head ===
+            if self.enable_aux_head and self.aux_head is not None and s == self.aux_stage_idx:
+                aux_output = self.aux_head(x, target_size=input_size)
+            
             if self.deep_supervision:
                 seg_outputs.append(self.seg_layers[s](x))
             elif s == (len(self.stages) - 1):
                 seg_outputs.append(self.seg_layers[-1](x))
+            
             lres_input = x
 
         seg_outputs = seg_outputs[::-1]
 
-        if not self.deep_supervision:
-            r = seg_outputs[0]
+        # === 返回值处理 ===
+        if self.enable_aux_head and aux_output is not None:
+            if not self.deep_supervision:
+                return seg_outputs[0], aux_output
+            else:
+                return seg_outputs, aux_output
         else:
-            r = seg_outputs
-        return r
+            if not self.deep_supervision:
+                return seg_outputs[0]
+            else:
+                return seg_outputs
 
     def compute_conv_feature_map_size(self, input_size):
         skip_sizes = []
@@ -392,13 +513,27 @@ class UNetResDecoder(nn.Module):
 
         output = np.int64(0)
         for s in range(len(self.stages)):
-            output += self.stages[s].compute_conv_feature_map_size(skip_sizes[-(s+1)])
-            output += np.prod([self.encoder.output_channels[-(s+2)], *skip_sizes[-(s+1)]], dtype=np.int64)
+            output += self.stages[s].compute_conv_feature_map_size(skip_sizes[-(s + 1)])
+            output += np.prod([self.encoder.output_channels[-(s + 2)], *skip_sizes[-(s + 1)]], dtype=np.int64)
             if self.deep_supervision or (s == (len(self.stages) - 1)):
-                output += np.prod([self.num_classes, *skip_sizes[-(s+1)]], dtype=np.int64)
+                output += np.prod([self.num_classes, *skip_sizes[-(s + 1)]], dtype=np.int64)
+        
+        # 修复: 计入 auxiliary head 的特征图大小
+        if self.enable_aux_head and self.aux_head is not None:
+            aux_stage_size = skip_sizes[-(self.aux_stage_idx + 1)]
+            output += self.aux_head.compute_conv_feature_map_size(aux_stage_size)
+        
         return output
-    
+
+
 class UMambaBot(nn.Module):
+    """
+    UMambaBot 网络
+    
+    本次修改:
+    1. 支持分层异构配置
+    2. 支持轻量 auxiliary head
+    """
     def __init__(self,
                  input_channels: int,
                  n_stages: int,
@@ -417,13 +552,24 @@ class UMambaBot(nn.Module):
                  nonlin: Union[None, Type[torch.nn.Module]] = None,
                  nonlin_kwargs: dict = None,
                  deep_supervision: bool = False,
-                 stem_channels: int = None, 
-                 enable_sdg: bool = False
+                 stem_channels: int = None,
+                 enable_sdg: bool = False,
+                 skip_modes: Optional[List[str]] = None,
+                 enable_aux_head: bool = False,
+                 aux_head_stage: int = 1
                  ):
         super().__init__()
-        print("\n" + "="*50)
-        print("🚀🚀🚀 恭喜！你正在运行修改后的新代码 (Scheme B)！🚀🚀🚀")
-        print("="*50 + "\n")
+        
+        print("\n" + "=" * 60)
+        print("🚀 UMambaBot 初始化")
+        print(f"   enable_sdg: {enable_sdg}")
+        print(f"   enable_aux_head: {enable_aux_head}")
+        if enable_sdg and skip_modes is None:
+            print("   skip_modes: 自动配置 (分层异构)")
+        elif skip_modes is not None:
+            print(f"   skip_modes: {skip_modes}")
+        print("=" * 60 + "\n")
+        
         n_blocks_per_stage = n_conv_per_stage
         if isinstance(n_blocks_per_stage, int):
             n_blocks_per_stage = [n_blocks_per_stage] * n_stages
@@ -431,19 +577,14 @@ class UMambaBot(nn.Module):
             n_conv_per_stage_decoder = [n_conv_per_stage_decoder] * (n_stages - 1)
 
         for s in range(math.ceil(n_stages / 2), n_stages):
-            n_blocks_per_stage[s] = 1    
+            n_blocks_per_stage[s] = 1
 
         for s in range(math.ceil((n_stages - 1) / 2 + 0.5), n_stages - 1):
             n_conv_per_stage_decoder[s] = 1
 
-
-        assert len(n_blocks_per_stage) == n_stages, "n_blocks_per_stage must have as many entries as we have " \
-                                                  f"resolution stages. here: {n_stages}. " \
-                                                  f"n_blocks_per_stage: {n_blocks_per_stage}"
-        assert len(n_conv_per_stage_decoder) == (n_stages - 1), "n_conv_per_stage_decoder must have one less entries " \
-                                                                f"as we have resolution stages. here: {n_stages} " \
-                                                                f"stages, so it should have {n_stages - 1} entries. " \
-                                                                f"n_conv_per_stage_decoder: {n_conv_per_stage_decoder}"
+        assert len(n_blocks_per_stage) == n_stages
+        assert len(n_conv_per_stage_decoder) == (n_stages - 1)
+        
         self.encoder = UNetResEncoder(
             input_channels,
             n_stages,
@@ -461,20 +602,28 @@ class UMambaBot(nn.Module):
             stem_channels=stem_channels,
         )
 
-        self.mamba_layer = MambaLayer(dim = features_per_stage[-1])
+        self.mamba_layer = MambaLayer(dim=features_per_stage[-1])
 
-        self.decoder = UNetResDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision, enable_sdg=enable_sdg)
+        self.decoder = UNetResDecoder(
+            self.encoder, 
+            num_classes, 
+            n_conv_per_stage_decoder, 
+            deep_supervision, 
+            enable_sdg=enable_sdg,
+            skip_modes=skip_modes,
+            enable_aux_head=enable_aux_head,
+            aux_head_stage=aux_head_stage
+        )
+        
+        self.enable_aux_head = enable_aux_head
 
     def forward(self, x):
+        input_size = x.shape[2:]
+        
         skips = self.encoder(x)
         skips[-1] = self.mamba_layer(skips[-1])
-        return self.decoder(skips)
-
-    def compute_conv_feature_map_size(self, input_size):
-        assert len(input_size) == convert_conv_op_to_dim(self.encoder.conv_op), "just give the image size without color/feature channels or " \
-                                                                                "batch channel. Do not give input_size=(b, c, x, y(, z)). " \
-                                                                                "Give input_size=(x, y(, z))!"
-        return self.encoder.compute_conv_feature_map_size(input_size) + self.decoder.compute_conv_feature_map_size(input_size)
+        
+        return self.decoder(skips, input_size=input_size)
 
 
 def get_umamba_bot_2d_from_plans(
@@ -483,13 +632,20 @@ def get_umamba_bot_2d_from_plans(
         configuration_manager: ConfigurationManager,
         num_input_channels: int,
         deep_supervision: bool = True,
-        enable_sdg: bool = False
+        enable_sdg: bool = False,
+        skip_modes: Optional[List[str]] = None,
+        enable_aux_head: bool = False,
+        aux_head_stage: int = 1
     ):
     """
-    we may have to change this in the future to accommodate other plans -> network mappings
-
-    num_input_channels can differ depending on whether we do cascade. Its best to make this info available in the
-    trainer rather than inferring it again from the plans here.
+    从 plans 配置构建 UMambaBot 网络
+    
+    新增参数:
+        skip_modes: 自定义每个 skip 层的模式列表 ['light', 'full', 'identity', ...]
+                    如果为 None，使用默认的分层异构配置
+                    注意: 只配置实际使用的 skip 层 (n_stages_decoder - 1 层)
+        enable_aux_head: 是否启用轻量辅助分割头
+        aux_head_stage: auxiliary head 接入的 decoder stage 索引
     """
     num_stages = len(configuration_manager.conv_kernel_sizes)
 
@@ -526,6 +682,9 @@ def get_umamba_bot_2d_from_plans(
         num_classes=label_manager.num_segmentation_heads,
         deep_supervision=deep_supervision,
         enable_sdg=enable_sdg,
+        skip_modes=skip_modes,
+        enable_aux_head=enable_aux_head,
+        aux_head_stage=aux_head_stage,
         **conv_or_blocks_per_stage,
         **kwargs[segmentation_network_class_name]
     )
