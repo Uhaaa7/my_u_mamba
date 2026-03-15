@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 def compute_urpc_loss(preds_unlabeled):
     """
@@ -36,12 +37,15 @@ def compute_urpc_loss(preds_unlabeled):
     
     return consistency_loss_final
 
-def get_current_consistency_weight(epoch, max_epoch=200, consistency=0.1):
+def get_current_consistency_weight(epoch, warmup_epochs=30, rampup_end=80, consistency=0.1):
     """
-    复刻 SSL4MIS 的 ramps.sigmoid_rampup，随着 epoch 增加缓慢增加一致性 loss 的比重
+    前 warmup_epochs 个 epoch 完全关闭 URPC loss
+    之后到 rampup_end 逐步升到 consistency
     """
-    if epoch >= max_epoch:
+    if epoch < warmup_epochs:
+        return 0.0
+    elif epoch >= rampup_end:
         return consistency
     else:
-        import numpy as np
-        return consistency * np.exp(-5.0 * (1.0 - epoch / max_epoch) ** 2)
+        progress = (epoch - warmup_epochs) / (rampup_end - warmup_epochs)
+        return consistency * np.exp(-5.0 * (1.0 - progress) ** 2)

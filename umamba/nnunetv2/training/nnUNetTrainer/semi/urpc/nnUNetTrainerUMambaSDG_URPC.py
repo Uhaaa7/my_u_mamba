@@ -87,7 +87,7 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
         dl_cls = nnUNetDataLoader2D if dim == 2 else nnUNetDataLoader3D
         
         dl_tr_labeled = dl_cls(dataset_tr_labeled, half_batch_size, initial_patch_size, self.configuration_manager.patch_size, self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent, sampling_probabilities=None, pad_sides=None)
-        dl_tr_unlabeled = dl_cls(dataset_tr_unlabeled, half_batch_size, initial_patch_size, self.configuration_manager.patch_size, self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent, sampling_probabilities=None, pad_sides=None)
+        dl_tr_unlabeled = dl_cls(dataset_tr_unlabeled, half_batch_size, initial_patch_size, self.configuration_manager.patch_size, self.label_manager, oversample_foreground_percent=0.0, sampling_probabilities=None, pad_sides=None)
         dl_val = dl_cls(dataset_val, self.batch_size, self.configuration_manager.patch_size, self.configuration_manager.patch_size, self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent, sampling_probabilities=None, pad_sides=None)
 
         # === 4. 包裹多线程数据增强管线 (极其重要) ===
@@ -137,17 +137,17 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
             # === 1. 有标签数据的前向传播与监督损失计算 ===
             output_labeled = self.network(data_labeled)
             
-            # 解析网络输出 (完美适配你的 SDG aux head)
+            # 解析网络输出 (分离主输出与 SDG 辅助头)
             if self.enable_aux_head and isinstance(output_labeled, tuple):
                 main_output_labeled, aux_output_labeled = output_labeled
             else:
                 main_output_labeled = output_labeled
                 aux_output_labeled = None
 
-            # 1.1 主损失：继续使用 nnUNet 原生 deep supervision loss
+            # 1.1 主损失：nnUNet 原生 deep supervision loss
             l_sup = self.loss(main_output_labeled, target_labeled)
             
-            # 1.2 辅助损失：使用你的单输出 CE loss
+            # 1.2 辅助损失：SDG 的单输出 CE loss
             if self.enable_aux_head and aux_output_labeled is not None:
                 aux_target = target_labeled[0] if isinstance(target_labeled, list) else target_labeled
                 if aux_target.ndim == 4 and aux_target.shape[1] == 1:
@@ -160,18 +160,27 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
             # === 2. 无标签数据的前向传播与 URPC 损失计算 ===
             output_unlabeled = self.network(data_unlabeled)
             
-            # 同样解包无标签的输出，URPC 只计算主网络深层监督的金字塔差异
+            # 【核心修改 A：语义隔离】
+            # 解包无标签的输出，彻底丢弃 SDG Aux Head 的特征输出，只保留纯粹的分割预测
             if self.enable_aux_head and isinstance(output_unlabeled, tuple):
                 main_output_unlabeled, _ = output_unlabeled
             else:
                 main_output_unlabeled = output_unlabeled
             
             if isinstance(main_output_unlabeled, (list, tuple)):
+                if len(main_output_unlabeled) < 4:
+                    raise ValueError(f"URPC 期望至少 4 个多尺度输出，当前只有 {len(main_output_unlabeled)} 个。")
                 target_shape = main_output_unlabeled[0].shape[2:] 
                 is_3d = len(target_shape) == 3
                 
+                # 【核心修改 B：金字塔截断，回归标准 URPC S=4】
+                # nnU-Net 的深层监督可能包含 5-6 层，底层分辨率极低（如 8x7）
+                # 强行对齐极低分辨率会导致模型塌缩，因此这里严格截取前 4 个最高分辨率的尺度
+                S = min(4, len(main_output_unlabeled))
+                urpc_pyramid = main_output_unlabeled[:S] 
+                
                 upsampled_outputs = []
-                for p in main_output_unlabeled:
+                for p in urpc_pyramid:
                     if p.shape[2:] != target_shape:
                         p_up = interpolate(
                             p, 
@@ -183,13 +192,13 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
                     else:
                         upsampled_outputs.append(p)
                 
-                # 计算多尺度一致性损失
+                # 计算标准 URPC 多尺度一致性损失
                 l_cons = compute_urpc_loss(upsampled_outputs)
             else:
                 raise ValueError("未检测到多尺度金字塔输出，请确保 deep_supervision=True。")
             
             # === 3. 合并总损失 ===
-            weight = get_current_consistency_weight(self.current_epoch)
+            weight = get_current_consistency_weight(self.current_epoch,warmup_epochs=30,rampup_end=80,consistency=0.1)
             l = l_sup + weight * l_cons
             
         self.grad_scaler.scale(l).backward()
@@ -203,21 +212,24 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
     def perform_actual_validation(self, save_probabilities: bool = False):
         """
         重写验证方法：通过 PyTorch 的 forward hook 拦截网络输出。
-        在最终的滑动窗口推理（包含 TTA 翻转）时，自动过滤掉 auxiliary head 产生的 tuple，
-        从而防止 nnUNetPredictor 内部的 torch.flip() 报错。
+        在最终的滑动窗口推理（包含 TTA 翻转）时，
+        自动过滤掉 auxiliary head 和 deep supervision 的多尺度输出，
+        最终只保留最高分辨率主输出 Tensor，供 nnUNetPredictor 使用。
         """
-        # 1. 定义一个钩子函数，拦截并修改前向传播的输出
         def unpack_tuple_hook(module, input, output):
+            # 先去掉 aux head
             if isinstance(output, tuple):
-                return output[0]  # 只保留主输出供推理使用，丢弃 aux 辅助输出
+                output = output[0]
+
+            # 再去掉 deep supervision，只保留最高分辨率主输出
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+
             return output
 
-        # 2. 临时将钩子挂载到网络上
         hook_handle = self.network.register_forward_hook(unpack_tuple_hook)
 
         try:
-            # 3. 调用父类的原生验证流程 (此时 Predictor 拿到的将是纯净的 Tensor)
             super().perform_actual_validation(save_probabilities)
         finally:
-            # 4. 无论验证是否成功，最后务必卸载钩子，保持网络纯净
             hook_handle.remove()

@@ -492,16 +492,23 @@ class UNetResDecoder(nn.Module):
         seg_outputs = seg_outputs[::-1]
 
         # === 返回值处理 ===
-        if self.enable_aux_head and aux_output is not None:
-            if not self.deep_supervision:
-                return seg_outputs[0], aux_output
+        # 训练阶段：保留完整输出，供 trainer 计算主损失 / aux loss / deep supervision
+        if self.training:
+            if self.enable_aux_head and aux_output is not None:
+                if not self.deep_supervision:
+                    return seg_outputs[0], aux_output
+                else:
+                    return seg_outputs, aux_output
             else:
-                return seg_outputs, aux_output
-        else:
-            if not self.deep_supervision:
-                return seg_outputs[0]
-            else:
-                return seg_outputs
+                if not self.deep_supervision:
+                    return seg_outputs[0]
+                else:
+                    return seg_outputs
+
+        # 推理 / 验证阶段：统一只返回主分割输出 Tensor
+        # 这样 nnUNetv2_predict 的 sliding window / mirroring / flip 都不会再拿到 tuple
+        return seg_outputs[0]
+
 
     def compute_conv_feature_map_size(self, input_size):
         skip_sizes = []

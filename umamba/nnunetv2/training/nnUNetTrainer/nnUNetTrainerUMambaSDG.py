@@ -148,20 +148,27 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
                 output = self.network(data)
 
-                # 验证时只使用主输出，忽略 auxiliary output
+                # 如果启用了 auxiliary head，则只取主输出
                 if self.enable_aux_head and isinstance(output, tuple):
                     main_output, _ = output
                 else:
                     main_output = output
 
-                l = self.loss(main_output, target)
-
-            if self.enable_deep_supervision:
-                output_for_metrics = main_output[0]
-                target_for_metrics = target[0]
-            else:
-                output_for_metrics = main_output
-                target_for_metrics = target
+                # ---- 兼容 deep supervision / 非 deep supervision 两种主输出格式 ----
+                if isinstance(main_output, (list, tuple)):
+                    # 主输出本身就是 deep supervision 多尺度输出
+                    l = self.loss(main_output, target)
+                    output_for_metrics = main_output[0]
+                    target_for_metrics = target[0] if isinstance(target, list) else target
+                else:
+                    # 主输出是单个 Tensor，但 target 可能仍是 list
+                    if isinstance(target, list):
+                        l = self.loss((main_output,), (target[0],))
+                        target_for_metrics = target[0]
+                    else:
+                        l = self.loss(main_output, target)
+                        target_for_metrics = target
+                    output_for_metrics = main_output
 
             axes = [0] + list(range(2, output_for_metrics.ndim))
 
@@ -210,3 +217,24 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
             'fp_hard': fp.detach().cpu().numpy(),
             'fn_hard': fn.detach().cpu().numpy()
         }
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        """
+        During actual validation/export, nnUNet predictor expects network(x) to return a Tensor.
+        Our network may return (main_output, aux_output) when auxiliary head is enabled.
+        Here we temporarily attach a forward hook to strip aux output and only keep main output.
+        """
+        if not self.enable_aux_head:
+            # No aux branch -> use parent implementation directly
+            return super().perform_actual_validation(save_probabilities)
+
+        def _unwrap_aux_output_hook(module, input, output):
+            if isinstance(output, tuple):
+                return output[0]  # keep only main output
+            return output
+
+        hook_handle = self.network.register_forward_hook(_unwrap_aux_output_hook)
+
+        try:
+            super().perform_actual_validation(save_probabilities)
+        finally:
+            hook_handle.remove()
