@@ -13,6 +13,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
     UMamba + SDG trainer
     - Hierarchical heterogeneous skip configuration
     - Optional lightweight auxiliary head
+    - Optional adaptive upsampling with DCNv2
     """
 
     # ====== 实验配置：以后做消融时直接改这里 ======
@@ -20,6 +21,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
     DEFAULT_ENABLE_AUX_HEAD: bool = True
     DEFAULT_AUX_HEAD_STAGE: int = 1
     DEFAULT_AUX_LOSS_WEIGHT: float = 0.4
+    DEFAULT_ENABLE_ADAPTIVE_UPSAMPLE: bool = True  # 是否启用自适应上采样模块
 
     def __init__(
         self,
@@ -37,6 +39,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
         self.enable_aux_head = self.DEFAULT_ENABLE_AUX_HEAD
         self.aux_head_stage = self.DEFAULT_AUX_HEAD_STAGE
         self.aux_loss_weight = self.DEFAULT_AUX_LOSS_WEIGHT
+        self.enable_adaptive_upsample = self.DEFAULT_ENABLE_ADAPTIVE_UPSAMPLE
 
         # auxiliary head 使用单输出普通损失，不复用 nnUNet deep supervision wrapper
         self.aux_ce_loss = nn.CrossEntropyLoss()
@@ -46,6 +49,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
         print(f"📋 skip_modes: {self.skip_modes if self.skip_modes is not None else '自动配置'}")
         print(f"🔧 enable_aux_head: {self.enable_aux_head}, aux_head_stage: {self.aux_head_stage}")
         print(f"⚖️ aux_loss_weight: {self.aux_loss_weight}")
+        print(f"🔄 enable_adaptive_upsample: {self.enable_adaptive_upsample}")
 
     @staticmethod
     def build_network_architecture(
@@ -60,6 +64,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
         skip_modes = nnUNetTrainerUMambaSDG.DEFAULT_SKIP_MODES
         enable_aux_head = nnUNetTrainerUMambaSDG.DEFAULT_ENABLE_AUX_HEAD
         aux_head_stage = nnUNetTrainerUMambaSDG.DEFAULT_AUX_HEAD_STAGE
+        enable_adaptive_upsample = nnUNetTrainerUMambaSDG.DEFAULT_ENABLE_ADAPTIVE_UPSAMPLE
 
         if len(configuration_manager.patch_size) == 2:
             model = get_umamba_bot_2d_from_plans(
@@ -71,7 +76,8 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
                 enable_sdg=True,
                 skip_modes=skip_modes,
                 enable_aux_head=enable_aux_head,
-                aux_head_stage=aux_head_stage
+                aux_head_stage=aux_head_stage,
+                enable_adaptive_upsample=enable_adaptive_upsample
             )
         elif len(configuration_manager.patch_size) == 3:
             raise NotImplementedError("SDG-Block 3D version not implemented yet")
@@ -81,6 +87,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
         print("🚀🚀🚀 [Ours Mode] UMambaBot with SDG-Block ENABLED! 🚀🚀🚀")
         print(f"📋 build_network_architecture -> skip_modes: {skip_modes if skip_modes is not None else '自动配置'}")
         print(f"🔧 build_network_architecture -> enable_aux_head: {enable_aux_head}, aux_head_stage: {aux_head_stage}")
+        print(f"🔄 build_network_architecture -> enable_adaptive_upsample: {enable_adaptive_upsample}")
 
         return model
 
