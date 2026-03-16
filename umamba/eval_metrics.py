@@ -16,7 +16,7 @@ except ModuleNotFoundError:
 # 1. 路径配置区 (运行前请务必检查这里！)
 # ==========================================
 # 预测结果文件夹 (先填 SDG 的，跑完再换成 Bot 的)
-PRED_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/predictions_nnUNet"
+PRED_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/predictions_SDG"
 
 # 测试集真实标签文件夹 (标准答案)
 GT_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/labelsTs"
