@@ -2,7 +2,6 @@ import os
 import numpy as np
 import SimpleITK as sitk
 
-# 异常捕获：处理可能不存在的依赖库
 try:
     from medpy import metric
 except ModuleNotFoundError:
@@ -12,38 +11,24 @@ except ModuleNotFoundError:
     print("   安装完成后重新运行本脚本即可。\n")
     exit()
 
-# ==========================================
-# 1. 路径配置区 (运行前请务必检查这里！)
-# ==========================================
-# 预测结果文件夹 (先填 SDG 的，跑完再换成 Bot 的)
-PRED_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/predictions_SDG"
-
-# 测试集真实标签文件夹 (标准答案)
+PRED_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/predictions_SwinUNETR"
 GT_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/labelsTs"
 
-# ==========================================
-# 2. 核心算分逻辑
-# ==========================================
 CLASSES = {1: "RV (右心室)", 2: "Myo (心肌)", 3: "LV (左心室)"}
 
 def calculate_metrics(pred, gt, class_id, voxel_spacing):
-    """同时计算单个类别的 Dice 和 HD95"""
     pred_mask = (pred == class_id)
     gt_mask = (gt == class_id)
     
-    # 极端情况一：预测和真值都没有这个器官 (完美预测为背景)
     if pred_mask.sum() == 0 and gt_mask.sum() == 0:
         return np.nan, np.nan
         
-    # 极端情况二：真值有，但没预测出来；或真值没有，但误判出了器官
     if pred_mask.sum() == 0 or gt_mask.sum() == 0:
-        return 0.0, np.nan # HD95 在空集下数学上无定义，记为 NaN 不参与均值计算
+        return 0.0, np.nan
     
-    # 计算 Dice
     intersection = np.logical_and(pred_mask, gt_mask).sum()
     dice = 2.0 * intersection / (pred_mask.sum() + gt_mask.sum())
     
-    # 计算 HD95 (必须传入 spacing 物理间距，否则算出来的是体素个数而不是毫米)
     try:
         hd95 = metric.binary.hd95(pred_mask, gt_mask, voxelspacing=voxel_spacing)
     except Exception as e:
@@ -71,16 +56,12 @@ def main():
             print(f"⚠️ 警告: 找不到对应的真实标签 {pred_filename}，跳过。")
             continue
 
-        # 读取图像信息
         pred_sitk = sitk.ReadImage(pred_path)
         gt_sitk = sitk.ReadImage(gt_path)
         
-        # 提取 Numpy 矩阵
         pred_img = sitk.GetArrayFromImage(pred_sitk)
         gt_img = sitk.GetArrayFromImage(gt_sitk)
         
-        # 💡 核心细节：SimpleITK 的间距是 (X, Y, Z)，而 Numpy 数组是 (Z, Y, X)
-        # 所以必须把 spacing 倒序传递给 medpy，才能保证 HD95 的物理距离计算正确！
         spacing = gt_sitk.GetSpacing()[::-1] 
 
         for class_id in CLASSES.keys():
@@ -90,43 +71,122 @@ def main():
                 all_dices[class_id].append(dice)
             if not np.isnan(hd95):
                 all_hd95s[class_id].append(hd95)
-                
-    # ==========================================
-    # 3. 打印可以直接抄进论文的表格数据
-    # ==========================================
-    print("="*65)
-    print(f"🏆 ACDC 测试集最终成绩单")
-    print("="*65)
-    print(f"{'器官类别':<15} | {'Dice (%) ↑':<20} | {'HD95 (mm) ↓':<20}")
-    print("-" * 65)
+    
+    output_lines = []
+    
+    output_lines.append("="*65)
+    output_lines.append("🏆 ACDC 测试集最终成绩单")
+    output_lines.append("="*65)
+    output_lines.append("器官类别            | Dice (%) ↑           | HD95 (mm) ↓         ")
+    output_lines.append("-" * 65)
     
     mean_dices, mean_hd95s = [], []
     
     for class_id, name in CLASSES.items():
-        # 处理 Dice
         if all_dices[class_id]:
             d_np = np.array(all_dices[class_id]) * 100
-            d_mean, d_std = np.mean(d_np), np.std(d_np)
+            d_mean = np.mean(d_np)
+            d_std = np.std(d_np, ddof=1)
             mean_dices.append(d_mean)
             dice_str = f"{d_mean:.2f} ± {d_std:.2f}"
         else:
             dice_str = "N/A"
             
-        # 处理 HD95
         if all_hd95s[class_id]:
             h_np = np.array(all_hd95s[class_id])
-            h_mean, h_std = np.mean(h_np), np.std(h_np)
+            h_mean = np.mean(h_np)
+            h_std = np.std(h_np, ddof=1)
             mean_hd95s.append(h_mean)
             hd_str = f"{h_mean:.2f} ± {h_std:.2f}"
         else:
             hd_str = "N/A"
             
-        print(f"{name:<15} | {dice_str:<20} | {hd_str:<20}")
+        output_lines.append(f"{name:<15} | {dice_str:<20} | {hd_str:<20}")
             
-    print("-" * 65)
+    output_lines.append("-" * 65)
     if mean_dices and mean_hd95s:
-        print(f"⭐ Average        | {np.mean(mean_dices):.2f}%               | {np.mean(mean_hd95s):.2f} mm")
-    print("="*65)
+        output_lines.append(f"⭐ Average        | {np.mean(mean_dices):.2f}%               | {np.mean(mean_hd95s):.2f} mm")
+    output_lines.append("="*65)
+    
+    output_lines.append("")
+    output_lines.append("="*75)
+    output_lines.append("📊 详细统计信息 (用于论文写作)")
+    output_lines.append("="*75)
+    output_lines.append("📌 说明:")
+    output_lines.append("   - SD (标准差): 反映病例间的变异性，数值大说明不同病例分割效果差异大")
+    output_lines.append("   - SEM (标准误 = SD/√n): 反映均值估计的精度，数值小说明均值估计可靠")
+    output_lines.append("   - 论文中常见做法: 报告 Mean±SD 或 Mean±SEM，请根据目标期刊要求选择")
+    output_lines.append("-" * 75)
+    output_lines.append("器官类别       | n    | Mean    | SD      | SEM     | Min     | Max     ")
+    output_lines.append("-" * 75)
+    
+    for class_id, name in CLASSES.items():
+        if all_dices[class_id]:
+            d_np = np.array(all_dices[class_id]) * 100
+            n = len(d_np)
+            mean = np.mean(d_np)
+            std = np.std(d_np, ddof=1)
+            sem = std / np.sqrt(n)
+            output_lines.append(f"{name:<12} | {n:<4} | {mean:<8.2f} | {std:<8.2f} | {sem:<8.2f} | {np.min(d_np):<8.2f} | {np.max(d_np):<8.2f}")
+    
+    output_lines.append("="*75)
+    
+    output_lines.append("")
+    output_lines.append("📝 论文写作建议:")
+    output_lines.append("   1. 如果期刊要求报告 Mean±SD:")
+    output_lines.append("      - 这反映的是病例间的变异性")
+    output_lines.append("      - SD 较大说明不同病例的分割难度差异大，这是医学图像的正常现象")
+    output_lines.append("   2. 如果期刊要求报告 Mean±SEM:")
+    output_lines.append("      - 这反映的是均值估计的精度")
+    output_lines.append("      - SEM 通常比 SD 小很多，看起来更'好看'")
+    output_lines.append("   3. ACDC 挑战赛官方排行榜通常报告 Mean±SD")
+    output_lines.append("   4. 如果 SD 确实较大，可以在论文中解释:")
+    output_lines.append("      '较大的标准差反映了 ACDC 数据集中不同病例间解剖结构和图像质量的显著差异'")
+    
+    output_lines.append("")
+    output_lines.append("="*75)
+    output_lines.append("📋 可直接复制到论文的表格 (Mean±SD 格式):")
+    output_lines.append("="*75)
+    output_lines.append("Class      | Dice (%)       ")
+    output_lines.append("-" * 30)
+    for class_id, name in CLASSES.items():
+        if all_dices[class_id]:
+            d_np = np.array(all_dices[class_id]) * 100
+            mean = np.mean(d_np)
+            std = np.std(d_np, ddof=1)
+            short_name = name.split('(')[0].strip()
+            output_lines.append(f"{short_name:<10} | {mean:.2f}±{std:.2f}")
+    if mean_dices:
+        avg_std = np.mean([np.std(np.array(all_dices[c])*100, ddof=1) for c in CLASSES.keys() if all_dices[c]])
+        output_lines.append(f"{'Avg':<10} | {np.mean(mean_dices):.2f}±{avg_std:.2f}")
+    
+    output_lines.append("")
+    output_lines.append("="*75)
+    output_lines.append("📋 可直接复制到论文的表格 (Mean±SEM 格式):")
+    output_lines.append("="*75)
+    output_lines.append("Class      | Dice (%)       ")
+    output_lines.append("-" * 30)
+    for class_id, name in CLASSES.items():
+        if all_dices[class_id]:
+            d_np = np.array(all_dices[class_id]) * 100
+            n = len(d_np)
+            mean = np.mean(d_np)
+            sem = np.std(d_np, ddof=1) / np.sqrt(n)
+            short_name = name.split('(')[0].strip()
+            output_lines.append(f"{short_name:<10} | {mean:.2f}±{sem:.2f}")
+    if mean_dices:
+        avg_sem = np.mean([np.std(np.array(all_dices[c])*100, ddof=1)/np.sqrt(len(all_dices[c])) for c in CLASSES.keys() if all_dices[c]])
+        output_lines.append(f"{'Avg':<10} | {np.mean(mean_dices):.2f}±{avg_sem:.2f}")
+    
+    output_content = "\n".join(output_lines)
+    
+    print(output_content)
+    
+    output_file = os.path.join(PRED_DIR, "eval_results.txt")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(output_content)
+    
+    print(f"\n✅ 结果已保存到: {output_file}")
 
 if __name__ == "__main__":
     main()

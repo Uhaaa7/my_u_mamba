@@ -5,11 +5,13 @@ Mean Teacher 网络包装器
 1. 添加边界分支
 2. 输出增强后的 skip 特征
 3. 同时输出主分割结果、辅助分割结果、边界预测和 skip 特征
+4. 添加 projection heads 用于 prototype-based semi-supervised learning
 
 设计原则:
 - 最小侵入式: 不修改原有 UMambaBot 结构
 - 通过 forward hook 拦截 skip 特征
 - 边界分支接入高分辨率 decoder 特征
+- Projection heads 将 skip 特征映射到 embedding space
 
 修复:
 1. 边界分支通道数在初始化时推断，确保 EMA 同步
@@ -25,8 +27,10 @@ import copy
 
 try:
     from .semi_supervised_modules import BoundaryHead
+    from .prototype_modules import MultiStageProjectionHeads
 except ImportError:
     from nnunetv2.training.nnUNetTrainer.semi.mean_teacher.semi_supervised_modules import BoundaryHead
+    from nnunetv2.training.nnUNetTrainer.semi.mean_teacher.prototype_modules import MultiStageProjectionHeads
 
 
 class MeanTeacherWrapper(nn.Module):
@@ -36,37 +40,44 @@ class MeanTeacherWrapper(nn.Module):
     包装原有的 UMambaBot 网络，添加:
     1. 边界分支 (BoundaryHead)
     2. Skip 特征收集机制
+    3. Projection heads (用于 prototype-based semi-supervised learning)
     
     输出格式:
-    - 有标签模式: (main_output, aux_output, boundary_output, skip_features)
+    - 有标签模式: (main_output, aux_output, boundary_output, skip_features, projections)
     - 无标签模式: 同上
     
     注意:
     - 原有网络结构完全保持不变
     - 边界分支通过 hook 接入 decoder 特征
     - Skip 特征通过 hook 从 SDG 模块收集
+    - Projection heads 将 skip 特征映射到 embedding space
     """
     
     def __init__(self,
                  base_model: nn.Module,
                  num_classes: int,
                  boundary_head_channels: int = None,
-                 boundary_stage: int = -1):
+                 boundary_stage: int = -1,
+                 enable_prototype: bool = True,
+                 projection_dim: int = 128):
         """
         Args:
             base_model: 原有的 UMambaBot 网络
             num_classes: 分割类别数
             boundary_head_channels: 边界分支隐藏通道数
             boundary_stage: 边界分支接入的 decoder stage (-1 表示最后一个 stage)
+            enable_prototype: 是否启用 prototype 分支
+            projection_dim: 投影维度
         """
         super().__init__()
         
         self.base_model = base_model
         self.num_classes = num_classes
         self.boundary_stage = boundary_stage
+        self.enable_prototype = enable_prototype
+        self.projection_dim = projection_dim
 
 
-        # 代理底层网络的关键属性，兼容 nnUNetTrainer 对 self.network.decoder / encoder 的访问
         self.decoder = self.base_model.decoder
         self.encoder = self.base_model.encoder
 
@@ -95,10 +106,49 @@ class MeanTeacherWrapper(nn.Module):
             hidden_channels=boundary_head_channels
         )
         
+        if enable_prototype:
+            skip_dims = self._infer_skip_dims()
+            if len(skip_dims) > 0:
+                self.projection_heads = MultiStageProjectionHeads(
+                    input_dims=skip_dims,
+                    projection_dim=projection_dim
+                )
+            else:
+                self.projection_heads = None
+                self.enable_prototype = False
+        else:
+            self.projection_heads = None
+        
         print(f"🔧 MeanTeacherWrapper initialized:")
         print(f"   - Boundary head at decoder stage {self.boundary_stage_idx} (channels={boundary_in_channels})")
         print(f"   - Aux head enabled: {self._has_aux_head}")
         print(f"   - Deep supervision: {self._has_deep_supervision}")
+        print(f"   - Prototype branch enabled: {self.enable_prototype}")
+        if self.enable_prototype and self.projection_heads is not None:
+            print(f"   - Projection dim: {projection_dim}")
+    
+    def _infer_skip_dims(self) -> List[int]:
+        """
+        推断每个 skip stage 的通道数
+        
+        用于初始化 projection heads
+        
+        Returns:
+            skip_dims: 每个 skip stage 的通道数列表
+        """
+        decoder = self.base_model.decoder
+        encoder = decoder.encoder
+        encoder_output_channels = encoder.output_channels
+        
+        n_used_skips = len(decoder.skip_modes) if hasattr(decoder, 'skip_modes') else 0
+        
+        skip_dims = []
+        for i in range(n_used_skips):
+            skip_idx = len(encoder_output_channels) - 2 - i
+            if skip_idx >= 0:
+                skip_dims.append(encoder_output_channels[skip_idx])
+        
+        return skip_dims
     
     def _infer_boundary_in_channels(self) -> int:
         """
@@ -181,7 +231,7 @@ class MeanTeacherWrapper(nn.Module):
         self.skip_features_buffer = []
         self.decoder_features_buffer = []
     
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor):
         """
         前向传播
         
@@ -189,12 +239,12 @@ class MeanTeacherWrapper(nn.Module):
             x: 输入图像 [B, C_in, H, W]
         
         Returns:
-            outputs: 包含以下键的字典
-                - 'main_output': 主分割输出 [B, C, H, W] 或 List[Tensor]
-                - 'aux_output': 辅助分割输出 [B, C, H, W] (如果启用)
-                - 'boundary_output': 边界预测 [B, 1, H, W]
-                - 'skip_features': 增强后的 skip 特征列表
+            训练模式: outputs dict
+            推理模式: main_output tensor [B, C, H, W]
         """
+        if not self.training:
+            return self.forward_inference(x)
+        
         self._clear_buffers()
         
         input_size = x.shape[2:]
@@ -223,6 +273,12 @@ class MeanTeacherWrapper(nn.Module):
         
         valid_skip_features = [f for f in self.skip_features_buffer if f is not None]
         outputs['skip_features'] = valid_skip_features if valid_skip_features else None
+        
+        if self.enable_prototype and self.projection_heads is not None and valid_skip_features:
+            projections = self.projection_heads(valid_skip_features)
+            outputs['projections'] = projections
+        else:
+            outputs['projections'] = None
         
         return outputs
     
@@ -294,12 +350,34 @@ class MeanTeacherWrapper(nn.Module):
     def get_skip_features(self, outputs: Dict[str, torch.Tensor]) -> Optional[List[torch.Tensor]]:
         """获取 skip 特征列表"""
         return outputs.get('skip_features')
+    
+    def get_projections(self, outputs: Dict[str, torch.Tensor]) -> Optional[List[torch.Tensor]]:
+        """获取 projection embeddings 列表"""
+        return outputs.get('projections')
+    
+    def project_skip_features(self, skip_features: List[torch.Tensor]) -> Optional[List[torch.Tensor]]:
+        """
+        将 skip 特征投影到 embedding space
+        
+        这个方法用于外部调用，比如在 teacher 模型上
+        
+        Args:
+            skip_features: skip 特征列表
+        
+        Returns:
+            projections: embedding 列表
+        """
+        if self.projection_heads is not None and skip_features:
+            return self.projection_heads(skip_features)
+        return None
 
 
 def wrap_model_for_mean_teacher(base_model: nn.Module,
                                 num_classes: int,
                                 boundary_head_channels: int = None,
-                                boundary_stage: int = -1) -> MeanTeacherWrapper:
+                                boundary_stage: int = -1,
+                                enable_prototype: bool = True,
+                                projection_dim: int = 128) -> MeanTeacherWrapper:
     """
     将基础模型包装为 Mean Teacher 兼容格式
     
@@ -308,6 +386,8 @@ def wrap_model_for_mean_teacher(base_model: nn.Module,
         num_classes: 分割类别数
         boundary_head_channels: 边界分支隐藏通道数
         boundary_stage: 边界分支接入的 decoder stage
+        enable_prototype: 是否启用 prototype 分支
+        projection_dim: 投影维度
     
     Returns:
         wrapped_model: 包装后的模型
@@ -316,7 +396,9 @@ def wrap_model_for_mean_teacher(base_model: nn.Module,
         base_model=base_model,
         num_classes=num_classes,
         boundary_head_channels=boundary_head_channels,
-        boundary_stage=boundary_stage
+        boundary_stage=boundary_stage,
+        enable_prototype=enable_prototype,
+        projection_dim=projection_dim
     )
 
 

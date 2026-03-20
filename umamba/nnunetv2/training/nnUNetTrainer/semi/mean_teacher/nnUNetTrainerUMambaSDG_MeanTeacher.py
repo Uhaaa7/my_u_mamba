@@ -7,6 +7,10 @@ Mean Teacher 半监督训练器
 1. 伪标签提纯模块: 基于主输出、辅助输出和边界信息协同评估
 2. Skip 特征蒸馏: 可靠性引导的增强 skip 特征蒸馏
 3. 边界一致性: 专门处理边界区域的约束
+4. Prototype-based Semi-supervised Learning:
+   - PGPC: Prototype-Guided Pixel Classification
+   - APC: Boundary-aware Adaptive Prototype Contrast
+   - PAC: Prototype Assignment Consistency
 
 修复:
 1. weak/strong augmentation 分离 (同一病例配对)
@@ -41,6 +45,7 @@ try:
         PseudoLabelRefiner
     )
     from .mean_teacher_wrapper import MeanTeacherWrapper, InferenceOnlyWrapper
+    from .prototype_modules import PrototypeBank, PrototypeLoss
 except ImportError:
     from nnunetv2.training.nnUNetTrainer.semi.mean_teacher.semi_supervised_modules import (
         SemiSupervisedLoss, 
@@ -52,6 +57,10 @@ except ImportError:
     from nnunetv2.training.nnUNetTrainer.semi.mean_teacher.mean_teacher_wrapper import (
         MeanTeacherWrapper, 
         InferenceOnlyWrapper
+    )
+    from nnunetv2.training.nnUNetTrainer.semi.mean_teacher.prototype_modules import (
+        PrototypeBank, 
+        PrototypeLoss
     )
 
 from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
@@ -78,19 +87,33 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
     4. 伪标签提纯
     5. 边界一致性
     6. Weak/Strong augmentation 分离 (同一病例配对)
+    7. Prototype-based Semi-supervised Learning
     """
     
     DEFAULT_EMA_DECAY: float = 0.999
     DEFAULT_EMA_WARMUP_STEPS: int = 2000
     DEFAULT_CONSISTENCY_WARMUP: int = 30
     DEFAULT_CONSISTENCY_RAMPUP: int = 80
-    DEFAULT_MAX_CONSISTENCY_WEIGHT: float = 1.0
+    DEFAULT_MAX_CONSISTENCY_WEIGHT: float = 0.1
     
     DEFAULT_SKIP_DISTILL_WEIGHT: float = 0.5
     DEFAULT_BOUNDARY_CONSISTENCY_WEIGHT: float = 0.3
     DEFAULT_PSEUDO_LABEL_WEIGHT: float = 1.0
     DEFAULT_BOUNDARY_WEIGHT: float = 0.4
     DEFAULT_AUX_WEIGHT: float = 0.4
+    
+    DEFAULT_ENABLE_PROTOTYPE: bool = False
+    DEFAULT_PROJECTION_DIM: int = 128
+    DEFAULT_NUM_PROTOTYPES_PER_CLASS: int = 5
+    DEFAULT_PROTOTYPE_MOMENTUM: float = 0.9
+    DEFAULT_PGPC_WEIGHT: float = 1.0
+    DEFAULT_APC_WEIGHT: float = 0.5
+    DEFAULT_PAC_WEIGHT: float = 0.3
+    
+    DEFAULT_INCONSISTENCY_PENALTY: float = 0.4
+    DEFAULT_BOUNDARY_DECAY_FACTOR: float = 0.3
+    DEFAULT_HIGH_RELIABILITY_THRESHOLD: float = 0.75
+    DEFAULT_LOW_RELIABILITY_THRESHOLD: float = 0.45
     
     def __init__(
         self,
@@ -103,8 +126,9 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
     ):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         
-        self.batch_size = 16
-
+        self.batch_size = 12
+        self.initial_lr = 0.001
+        
         self.unlabeled_batch_iter = None
         self.weak_transforms = None
         self.strong_transforms = None
@@ -121,13 +145,44 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
         self.boundary_weight = self.DEFAULT_BOUNDARY_WEIGHT
         self.aux_weight = self.DEFAULT_AUX_WEIGHT
         
+        self.enable_prototype = self.DEFAULT_ENABLE_PROTOTYPE
+        self.projection_dim = self.DEFAULT_PROJECTION_DIM
+        self.num_prototypes_per_class = self.DEFAULT_NUM_PROTOTYPES_PER_CLASS
+        self.prototype_momentum = self.DEFAULT_PROTOTYPE_MOMENTUM
+        self.pGPC_weight = self.DEFAULT_PGPC_WEIGHT
+        self.aPC_weight = self.DEFAULT_APC_WEIGHT
+        self.pAC_weight = self.DEFAULT_PAC_WEIGHT
+        
+        self.inconsistency_penalty = self.DEFAULT_INCONSISTENCY_PENALTY
+        self.boundary_decay_factor = self.DEFAULT_BOUNDARY_DECAY_FACTOR
+        self.high_reliability_threshold = self.DEFAULT_HIGH_RELIABILITY_THRESHOLD
+        self.low_reliability_threshold = self.DEFAULT_LOW_RELIABILITY_THRESHOLD
+        
+        self.prototype_bank = None
+        self.prototype_loss = None
+        self.prototype_initialized = False
+        
         print("=" * 60)
         print("🔥🔥🔥 Mean Teacher 半监督训练器已加载 🔥🔥🔥")
+        print(f"   initial_lr: {self.initial_lr}")
+        print(f"   batch_size: {self.batch_size}")
         print(f"   EMA decay: {self.ema_decay}")
         print(f"   Consistency warmup: {self.consistency_warmup} epochs")
         print(f"   Consistency rampup: {self.consistency_rampup} epochs")
         print(f"   Skip distill weight: {self.skip_distill_weight}")
         print(f"   Boundary consistency weight: {self.boundary_consistency_weight}")
+        print(f"   Inconsistency penalty: {self.inconsistency_penalty}")
+        print(f"   Boundary decay factor: {self.boundary_decay_factor}")
+        print(f"   High reliability threshold: {self.high_reliability_threshold}")
+        print(f"   Low reliability threshold: {self.low_reliability_threshold}")
+        print(f"   Enable prototype: {self.enable_prototype}")
+        if self.enable_prototype:
+            print(f"   Projection dim: {self.projection_dim}")
+            print(f"   Num prototypes per class: {self.num_prototypes_per_class}")
+            print(f"   Prototype momentum: {self.prototype_momentum}")
+            print(f"   PGPC weight: {self.pGPC_weight}")
+            print(f"   APC weight: {self.aPC_weight}")
+            print(f"   PAC weight: {self.pAC_weight}")
         print("=" * 60)
     
     @staticmethod
@@ -144,6 +199,10 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
         skip_modes = nnUNetTrainerUMambaSDG.DEFAULT_SKIP_MODES
         enable_aux_head = nnUNetTrainerUMambaSDG.DEFAULT_ENABLE_AUX_HEAD
         aux_head_stage = nnUNetTrainerUMambaSDG.DEFAULT_AUX_HEAD_STAGE
+        enable_adaptive_upsample = nnUNetTrainerUMambaSDG.DEFAULT_ENABLE_ADAPTIVE_UPSAMPLE
+        
+        enable_prototype = kwargs.get('enable_prototype', nnUNetTrainerUMambaSDG_MeanTeacher.DEFAULT_ENABLE_PROTOTYPE)
+        projection_dim = kwargs.get('projection_dim', nnUNetTrainerUMambaSDG_MeanTeacher.DEFAULT_PROJECTION_DIM)
         
         if len(configuration_manager.patch_size) == 2:
             base_model = get_umamba_bot_2d_from_plans(
@@ -155,7 +214,8 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
                 enable_sdg=True,
                 skip_modes=skip_modes,
                 enable_aux_head=enable_aux_head,
-                aux_head_stage=aux_head_stage
+                aux_head_stage=aux_head_stage,
+                enable_adaptive_upsample=enable_adaptive_upsample
             )
         else:
             raise NotImplementedError("Only 2D models are supported for Mean Teacher currently")
@@ -166,10 +226,12 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
         wrapped_model = MeanTeacherWrapper(
             base_model=base_model,
             num_classes=num_classes,
-            boundary_stage=-1
+            boundary_stage=-1,
+            enable_prototype=enable_prototype,
+            projection_dim=projection_dim
         )
         
-        print("🚀🚀🚀 [Mean Teacher Mode] UMambaBot with SDG-Block + Boundary Branch! 🚀🚀🚀")
+        print("🚀🚀🚀 [Mean Teacher Mode] UMambaBot with SDG-Block + Boundary Branch + Prototype! 🚀🚀🚀")
         
         return wrapped_model
     
@@ -196,11 +258,37 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
             boundary_weight=self.boundary_weight
         )
         
-        self.pseudo_label_refiner = PseudoLabelRefiner(num_classes=num_classes)
+        self.pseudo_label_refiner = PseudoLabelRefiner(
+            num_classes=num_classes,
+            inconsistency_penalty=self.inconsistency_penalty,
+            boundary_decay_factor=self.boundary_decay_factor,
+            high_reliability_threshold=self.high_reliability_threshold,
+            low_reliability_threshold=self.low_reliability_threshold
+        )
         
         self.boundary_loss = nn.BCEWithLogitsLoss(reduction='none')
         
         self.aux_ce_loss = nn.CrossEntropyLoss(reduction='none')
+        
+        if self.enable_prototype:
+            num_stages = len(self.network.skip_modes) if hasattr(self.network, 'skip_modes') else 3
+            
+            self.prototype_bank = PrototypeBank(
+                num_stages=num_stages,
+                num_classes=num_classes,
+                num_prototypes_per_class=self.num_prototypes_per_class,
+                projection_dim=self.projection_dim,
+                momentum=self.prototype_momentum,
+                device=self.device
+            )
+            
+            self.prototype_loss = PrototypeLoss(
+                prototype_bank=self.prototype_bank,
+                num_classes=num_classes,
+                temperature=0.1
+            )
+            
+            print(f"🔧 Prototype bank initialized with {num_stages} stages, {num_classes} classes")
     
     def get_dataloaders(self):
         """
@@ -372,10 +460,45 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
 
         
         boundary_output = self.network.get_boundary_output_tensor(outputs)
+        boundary_target = None
         if boundary_output is not None:
             boundary_target = self._get_boundary_target(target)
             boundary_loss = self.boundary_loss(boundary_output, boundary_target).mean()
             losses['boundary_loss'] = boundary_loss * self.boundary_weight
+        
+        if self.enable_prototype and self.prototype_bank is not None:
+            projections = self.network.get_projections(outputs)
+            if projections is not None and boundary_target is not None:
+                if not self.prototype_initialized:
+                    target_for_proto = target_list[0]
+                    if target_for_proto.ndim == 4 and target_for_proto.shape[1] == 1:
+                        target_for_proto = target_for_proto[:, 0]
+                    
+                    self.prototype_bank.initialize_from_labeled_data(
+                        projections, target_for_proto, boundary_target
+                    )
+                    self.prototype_initialized = True
+                
+                target_for_proto = target_list[0]
+                if target_for_proto.ndim == 4 and target_for_proto.shape[1] == 1:
+                    target_for_proto = target_for_proto[:, 0]
+                
+                reliability_map = torch.ones_like(boundary_target)
+                proto_losses = self.prototype_loss(
+                    student_projections=projections,
+                    teacher_projections=projections,
+                    pseudo_labels=target_for_proto,
+                    reliability_map=reliability_map,
+                    boundary_map=boundary_target,
+                    high_reliability_threshold=self.high_reliability_threshold,
+                    low_reliability_threshold=self.low_reliability_threshold,
+                    pgpc_weight=self.pGPC_weight,
+                    apc_weight=self.aPC_weight,
+                    pac_weight=0.0
+                )
+                
+                losses['pgpc_loss'] = proto_losses['pgpc_loss']
+                losses['apc_loss'] = proto_losses['apc_loss']
         
         losses['total'] = sum(losses.values())
         return losses
@@ -434,6 +557,38 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
             )
             losses['boundary_consistency_loss'] = boundary_loss * self.boundary_consistency_weight
         
+        if self.enable_prototype and self.prototype_bank is not None and self.prototype_initialized:
+            teacher_projections = self.network.get_projections(teacher_outputs)
+            student_projections = self.network.get_projections(student_outputs)
+            
+            if teacher_projections is not None and student_projections is not None:
+                teacher_boundary_for_proto = torch.sigmoid(teacher_boundary) if teacher_boundary is not None else reliability_map
+                
+                self.prototype_bank.update(
+                    projections=teacher_projections,
+                    labels=pseudo_label,
+                    reliability_map=reliability_map,
+                    boundary_map=teacher_boundary_for_proto,
+                    high_reliability_threshold=self.high_reliability_threshold
+                )
+                
+                proto_losses = self.prototype_loss(
+                    student_projections=student_projections,
+                    teacher_projections=teacher_projections,
+                    pseudo_labels=pseudo_label,
+                    reliability_map=reliability_map,
+                    boundary_map=teacher_boundary_for_proto,
+                    high_reliability_threshold=self.high_reliability_threshold,
+                    low_reliability_threshold=self.low_reliability_threshold,
+                    pgpc_weight=self.pGPC_weight,
+                    apc_weight=self.aPC_weight,
+                    pac_weight=self.pAC_weight
+                )
+                
+                losses['pgpc_loss'] = proto_losses['pgpc_loss']
+                losses['apc_loss'] = proto_losses['apc_loss']
+                losses['pac_loss'] = proto_losses['pac_loss']
+        
         losses['total'] = sum(losses.values())
         return losses
 
@@ -444,9 +599,10 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
         关键改进：无标签数据从同一个 batch 获取，然后分别应用 weak/strong transform
         确保 teacher 和 student 看到同一张图像的不同增强版本
         
-        注意：当前实现中，dataloader 已经应用了 strong transform。
-        对于 weak 版本，我们使用相同的数据但应用较弱的扰动（如较小的旋转）。
-        这是一个简化实现，更完整的实现需要在 dataloader 层面获取原始数据。
+        数据流:
+        1. 无标签 dataloader 使用 _identity_transform，返回原始数据
+        2. 在 train_step 中对原始数据分别应用 weak/strong augmentation
+        3. Teacher 使用 weak augmentation，Student 使用 strong augmentation
         """
         data_labeled = batch['data']
         target_labeled = batch['target']
@@ -496,8 +652,11 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
                 student_outputs_unlabeled = self.network(data_unlabeled_strong)
                 
                 teacher_model = self.ema_model.get_model()
+                was_training = teacher_model.training
+                teacher_model.train()
                 with torch.no_grad():
                     teacher_outputs_unlabeled = teacher_model(data_unlabeled_weak)
+                teacher_model.train(was_training)
                 
                 unlabeled_losses = self._compute_unlabeled_loss(student_outputs_unlabeled, teacher_outputs_unlabeled)
                 
@@ -591,9 +750,12 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
 
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
-                outputs = self.network(data)
+                main_output = self.network(data)
                 
-                main_outputs = self.network.get_all_main_outputs(outputs)
+                if isinstance(main_output, (list, tuple)):
+                    main_outputs = list(main_output)
+                else:
+                    main_outputs = [main_output]
                 
                 if isinstance(target, (list, tuple)):
                     target_list = target

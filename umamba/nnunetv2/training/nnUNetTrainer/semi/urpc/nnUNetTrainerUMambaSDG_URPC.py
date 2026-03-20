@@ -19,10 +19,34 @@ from batchgenerators.dataloading.single_threaded_augmenter import SingleThreaded
 from nnunetv2.training.data_augmentation.custom_transforms.limited_length_multithreaded_augmenter import LimitedLenWrapper
 
 class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
+    """
+    URPC 半监督训练器
+    
+    显式配置:
+    - initial_lr: 初始学习率
+    - warmup_epochs: URPC loss 预热期
+    - rampup_end: URPC loss 达到最大权重的 epoch
+    - consistency: 最大一致性损失权重
+    """
+    
+
+    warmup_epochs = 30
+    rampup_end = 80
+    consistency_weight = 0.1
+    
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True, device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         self.unlabeled_batch_iter = None
+        self.initial_lr = 0.001
         
+        print("=" * 60)
+        print("🔥🔥🔥 URPC 半监督训练器配置 🔥🔥🔥")
+        print(f"   initial_lr: {self.initial_lr}")
+        print(f"   warmup_epochs: {self.warmup_epochs}")
+        print(f"   rampup_end: {self.rampup_end}")
+        print(f"   consistency_weight: {self.consistency_weight}")
+        print(f"   batch_size: {self.batch_size}")
+        print("=" * 60)
     def get_dataloaders(self):
         """
         重写数据加载逻辑：实例化有标签和无标签的 Dataset，并完美接入 nnU-Net 原生的数据增强与深层监督下采样管道。
@@ -198,7 +222,12 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
                 raise ValueError("未检测到多尺度金字塔输出，请确保 deep_supervision=True。")
             
             # === 3. 合并总损失 ===
-            weight = get_current_consistency_weight(self.current_epoch,warmup_epochs=30,rampup_end=80,consistency=0.1)
+            weight = get_current_consistency_weight(
+                self.current_epoch,
+                warmup_epochs=self.warmup_epochs,
+                rampup_end=self.rampup_end,
+                consistency=self.consistency_weight
+            )
             l = l_sup + weight * l_cons
             
         self.grad_scaler.scale(l).backward()

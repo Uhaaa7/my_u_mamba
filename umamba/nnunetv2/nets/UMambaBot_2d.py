@@ -522,6 +522,15 @@ class UNetResDecoder(nn.Module):
             if s < n_used_skips:
                 skip_feature = skips[-(s + 2)]
                 skip_feature = self.sdg_blocks[s](skip_feature)
+                
+                if x.shape[2:] != skip_feature.shape[2:]:
+                    skip_feature = F.interpolate(
+                        skip_feature, 
+                        size=x.shape[2:], 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                
                 x = torch.cat((x, skip_feature), 1)
             
             x = self.stages[s](x)
@@ -538,12 +547,16 @@ class UNetResDecoder(nn.Module):
 
         seg_outputs = seg_outputs[::-1]
 
+        if not self.training:
+            return seg_outputs[0]
+
+        # training
         if self.enable_aux_head and aux_output is not None:
             if self.deep_supervision:
                 return seg_outputs, aux_output
             else:
                 return seg_outputs[0], aux_output
-        
+
         if self.deep_supervision:
             return seg_outputs
         else:

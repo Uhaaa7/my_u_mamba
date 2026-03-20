@@ -17,7 +17,7 @@ class nnUNetTrainerUMambaSDG(nnUNetTrainerUMambaBot):
     """
 
     # ====== 实验配置：以后做消融时直接改这里 ======
-    DEFAULT_SKIP_MODES: Optional[List[str]] = None   # None 表示自动配置
+    DEFAULT_SKIP_MODES: Optional[List[str]] = None  # None 表示自动配置
     DEFAULT_ENABLE_AUX_HEAD: bool = True
     DEFAULT_AUX_HEAD_STAGE: int = 1
     DEFAULT_AUX_LOSS_WEIGHT: float = 0.4

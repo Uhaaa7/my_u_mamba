@@ -88,7 +88,7 @@ class BoundaryHead(nn.Module):
             mask: 分割标签 [B, H, W] 或 [B, 1, H, W]
             num_classes: 类别数 (如果为 None，从 mask 中推断)
             kernel_size: 腐蚀核大小
-            ignore_background: 是否忽略背景类的边界
+            ignore_background: 是否忽略背景类
         
         Returns:
             boundary: 边界 GT [B, 1, H, W], 值为 0/1
@@ -140,20 +140,21 @@ class PseudoLabelRefiner(nn.Module):
     - reliability_map: 可靠性图 [B, 1, H, W]
     
     核心思想:
-    1. 主输出与辅助输出的一致性评估
-    2. 边界区域的置信度衰减
-    3. 多信息源协同生成可靠性图
+    1. 主输出提供基础伪标签
+    2. 主辅一致性校验：一致不惩罚，不一致降权
+    3. 主辅置信度几何平均融合
+    4. 边界区域轻度衰减
     """
     def __init__(self, 
                  num_classes: int,
-                 consistency_threshold: float = 0.7,
-                 boundary_decay_factor: float = 0.5,
-                 high_reliability_threshold: float = 0.9,
-                 low_reliability_threshold: float = 0.5):
+                 inconsistency_penalty: float = 0.4,
+                 boundary_decay_factor: float = 0.3,
+                 high_reliability_threshold: float = 0.75,
+                 low_reliability_threshold: float = 0.45):
         super().__init__()
         
         self.num_classes = num_classes
-        self.consistency_threshold = consistency_threshold
+        self.inconsistency_penalty = inconsistency_penalty
         self.boundary_decay_factor = boundary_decay_factor
         self.high_reliability_threshold = high_reliability_threshold
         self.low_reliability_threshold = low_reliability_threshold
@@ -175,22 +176,29 @@ class PseudoLabelRefiner(nn.Module):
         final_prob = F.softmax(teacher_final_pred, dim=1)
         final_confidence, pseudo_label = final_prob.max(dim=1)
         
-        reliability = final_confidence.unsqueeze(1)
-        
         if teacher_aux_pred is not None:
+            if teacher_aux_pred.shape[2:] != teacher_final_pred.shape[2:]:
+                teacher_aux_pred = F.interpolate(
+                    teacher_aux_pred, 
+                    size=teacher_final_pred.shape[2:], 
+                    mode='bilinear', 
+                    align_corners=False
+                )
             aux_prob = F.softmax(teacher_aux_pred, dim=1)
             aux_confidence, aux_pred = aux_prob.max(dim=1)
             
             consistency = (pseudo_label == aux_pred).float().unsqueeze(1)
             
-            consistency_weight = consistency * self.consistency_threshold + (1 - consistency) * (1 - self.consistency_threshold)
-            reliability = reliability * consistency_weight
+            consistency_weight = consistency + (1 - consistency) * self.inconsistency_penalty
             
-            reliability = reliability * (final_confidence.unsqueeze(1) * aux_confidence.unsqueeze(1)).sqrt()
+            base_confidence = (final_confidence.unsqueeze(1) * aux_confidence.unsqueeze(1)).sqrt()
+            
+            reliability = base_confidence * consistency_weight
+        else:
+            reliability = final_confidence.unsqueeze(1)
         
         if teacher_boundary is not None:
             boundary_prob = torch.sigmoid(teacher_boundary)
-            
             boundary_penalty = 1 - boundary_prob * self.boundary_decay_factor
             reliability = reliability * boundary_penalty
         
@@ -355,14 +363,16 @@ class SemiSupervisedLoss(nn.Module):
     
     组成:
     1. 有标签数据的监督损失 (主损失 + 辅助损失 + 边界损失)
-    2. 无标签数据的伪标签损失 (可靠性加权)
+    2. 无标签数据的伪标签损失 (可靠性分级监督)
     3. Skip 特征蒸馏损失
     4. 边界一致性损失
     """
     def __init__(self,
                  num_classes: int,
-                 consistency_threshold: float = 0.7,
-                 boundary_decay_factor: float = 0.5,
+                 inconsistency_penalty: float = 0.4,
+                 boundary_decay_factor: float = 0.3,
+                 high_reliability_threshold: float = 0.75,
+                 low_reliability_threshold: float = 0.45,
                  skip_distill_weight: float = 0.5,
                  boundary_consistency_weight: float = 0.3,
                  pseudo_label_weight: float = 1.0,
@@ -370,11 +380,15 @@ class SemiSupervisedLoss(nn.Module):
         super().__init__()
         
         self.num_classes = num_classes
+        self.high_reliability_threshold = high_reliability_threshold
+        self.low_reliability_threshold = low_reliability_threshold
         
         self.pseudo_label_refiner = PseudoLabelRefiner(
             num_classes=num_classes,
-            consistency_threshold=consistency_threshold,
-            boundary_decay_factor=boundary_decay_factor
+            inconsistency_penalty=inconsistency_penalty,
+            boundary_decay_factor=boundary_decay_factor,
+            high_reliability_threshold=high_reliability_threshold,
+            low_reliability_threshold=low_reliability_threshold
         )
         
         self.skip_distill_loss = SkipDistillationLoss(loss_type='mse')
@@ -439,6 +453,11 @@ class SemiSupervisedLoss(nn.Module):
         """
         计算无标签数据的半监督损失
         
+        可靠性分级监督:
+        - 高可靠区域 (R >= 0.75): Hard CE (直接用 pseudo label)
+        - 中可靠区域 (0.45 <= R < 0.75): Soft KL (匹配 teacher 的 soft distribution) × 0.5
+        - 低可靠区域 (R < 0.45): 弱 CE (弱监督) × 0.1
+        
         Args:
             student_*: student 的各种输出
             teacher_*: teacher 的各种输出
@@ -452,10 +471,55 @@ class SemiSupervisedLoss(nn.Module):
             pseudo_label, reliability_map = self.pseudo_label_refiner(
                 teacher_main_output, teacher_aux_output, teacher_boundary
             )
+            teacher_prob = F.softmax(teacher_main_output, dim=1)
         
-        pseudo_loss = self.ce_loss(student_main_output, pseudo_label)
-        reliability_resized = F.interpolate(reliability_map, size=pseudo_loss.shape[2:], mode='bilinear', align_corners=False)
-        pseudo_loss = (pseudo_loss * reliability_resized.squeeze(1)).mean()
+        B, C, H, W = student_main_output.shape
+        student_log_prob = F.log_softmax(student_main_output, dim=1)
+        
+        reliability_resized = F.interpolate(reliability_map, size=(H, W), mode='bilinear', align_corners=False).squeeze(1)
+        
+        high_mask = reliability_resized >= self.high_reliability_threshold
+        medium_mask = (reliability_resized >= self.low_reliability_threshold) & (reliability_resized < self.high_reliability_threshold)
+        low_mask = reliability_resized < self.low_reliability_threshold
+        
+        pseudo_loss = torch.tensor(0.0, device=student_main_output.device)
+        
+        if high_mask.any():
+            high_ce_loss = F.cross_entropy(
+                student_main_output, 
+                pseudo_label, 
+                reduction='none'
+            )
+            high_loss = (high_ce_loss * high_mask.float()).sum() / (high_mask.float().sum() + 1e-6)
+            pseudo_loss = pseudo_loss + high_loss
+        
+        if medium_mask.any():
+            teacher_prob_resized = teacher_prob
+            kl_loss = F.kl_div(
+                student_log_prob,
+                teacher_prob_resized,
+                reduction='none'
+            ).sum(dim=1)
+            medium_loss = (kl_loss * medium_mask.float()).sum() / (medium_mask.float().sum() + 1e-6)
+            pseudo_loss = pseudo_loss + medium_loss * 0.5
+        
+        if low_mask.any():
+            low_ce_loss = F.cross_entropy(
+                student_main_output,
+                pseudo_label,
+                reduction='none'
+            )  # [B, H, W]
+
+            if low_mask.dim() == 4:
+                low_mask = low_mask.squeeze(1)
+
+            low_mask = low_mask.float()
+
+            low_loss = (low_ce_loss * low_mask).sum() / (low_mask.sum() + 1e-6)
+            low_loss = low_loss * 0.1
+
+            pseudo_loss = pseudo_loss + low_loss
+        
         losses['pseudo_label_loss'] = pseudo_loss * self.pseudo_label_weight
         
         skip_loss = self.skip_distill_loss(student_skip_features, teacher_skip_features, reliability_map)
@@ -606,28 +670,16 @@ if __name__ == '__main__':
     print(f"   Boundary consistency loss: {boundary_loss.item():.4f}")
     
     print("\n5. Testing EMAModel...")
-    class DummyModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.conv = nn.Conv2d(3, 16, 3, padding=1)
-            self.bn = nn.BatchNorm2d(16)
-        def forward(self, x):
-            return self.bn(self.conv(x))
-    
-    student = DummyModel()
-    ema = EMAModel(student, decay=0.999)
-    
-    for _ in range(10):
-        student.conv.weight.data.add_(torch.randn_like(student.conv.weight) * 0.01)
-        ema.update(student)
-    
-    teacher = ema.get_model()
-    print(f"   Student weight mean: {student.conv.weight.mean().item():.4f}")
-    print(f"   Teacher weight mean: {teacher.conv.weight.mean().item():.4f}")
+    simple_model = nn.Sequential(nn.Linear(10, 10))
+    ema = EMAModel(simple_model, decay=0.999, warmup_steps=100)
+    print(f"   Initial decay: {ema.get_decay():.6f}")
+    for _ in range(50):
+        ema.update(simple_model)
+    print(f"   Decay after 50 steps: {ema.get_decay():.6f}")
     
     print("\n6. Testing consistency weight schedule...")
-    for epoch in [0, 10, 30, 50, 80, 100]:
-        weight = get_current_consistency_weight(epoch)
-        print(f"   Epoch {epoch}: weight = {weight:.4f}")
+    for epoch in [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
+        weight = get_current_consistency_weight(epoch, warmup_epochs=30, rampup_end=80)
+        print(f"   Epoch {epoch}: consistency weight = {weight:.4f}")
     
-    print("\n✅ All tests passed!")
+    print("\nAll tests passed!")
