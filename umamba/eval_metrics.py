@@ -11,7 +11,7 @@ except ModuleNotFoundError:
     print("   安装完成后重新运行本脚本即可。\n")
     exit()
 
-PRED_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/predictions_SwinUNETR"
+PRED_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/predictions_UAMT"
 GT_DIR = "/home/dministrator/U-Mamba/data/nnUNet_raw/Dataset027_ACDC/labelsTs"
 
 CLASSES = {1: "RV (右心室)", 2: "Myo (心肌)", 3: "LV (左心室)"}

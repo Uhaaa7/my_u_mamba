@@ -30,14 +30,14 @@ class nnUNetTrainerUMambaSDG_URPC(nnUNetTrainerUMambaSDG):
     """
     
 
-    warmup_epochs = 30
-    rampup_end = 80
+    warmup_epochs = 15
+    rampup_end = 40
     consistency_weight = 0.1
     
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True, device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         self.unlabeled_batch_iter = None
-        self.initial_lr = 0.001
+        self.initial_lr = 0.005
         
         print("=" * 60)
         print("🔥🔥🔥 URPC 半监督训练器配置 🔥🔥🔥")

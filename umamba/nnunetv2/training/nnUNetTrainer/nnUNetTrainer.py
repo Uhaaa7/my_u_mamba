@@ -174,6 +174,12 @@ class nnUNetTrainer(object):
 
         ### initializing stuff for remembering things and such
         self._best_ema = None
+        
+        ### early stopping
+        self.patience = 30  # 早停耐心值，多少个epoch没有提升就停止
+        self.min_delta = 0.0001  # 最小提升阈值
+        self._epochs_without_improvement = 0  # 没有提升的epoch计数
+        self._early_stop = False  # 早停标志
 
         ### inference things
         self.inference_allowed_mirroring_axes = None  # this variable is set in
@@ -1044,10 +1050,20 @@ class nnUNetTrainer(object):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
+        current_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        if self._best_ema is None or current_ema > self._best_ema + self.min_delta:
+            improvement = current_ema - (self._best_ema if self._best_ema is not None else 0)
+            self._best_ema = current_ema
+            self._epochs_without_improvement = 0
+            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)} (improvement: {improvement:.6f})")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+        else:
+            self._epochs_without_improvement += 1
+            self.print_to_log_file(f"No improvement for {self._epochs_without_improvement} epoch(s). Best EMA: {np.round(self._best_ema, decimals=4)}")
+            
+            if self._epochs_without_improvement >= self.patience:
+                self._early_stop = True
+                self.print_to_log_file(f"Early stopping triggered! No improvement for {self.patience} epochs.")
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
@@ -1266,5 +1282,9 @@ class nnUNetTrainer(object):
                 self.on_validation_epoch_end(val_outputs)
 
             self.on_epoch_end()
+            
+            if self._early_stop:
+                self.print_to_log_file(f"Early stopping at epoch {self.current_epoch}")
+                break
 
         self.on_train_end()

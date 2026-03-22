@@ -92,8 +92,8 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
     
     DEFAULT_EMA_DECAY: float = 0.999
     DEFAULT_EMA_WARMUP_STEPS: int = 2000
-    DEFAULT_CONSISTENCY_WARMUP: int = 30
-    DEFAULT_CONSISTENCY_RAMPUP: int = 80
+    DEFAULT_CONSISTENCY_WARMUP: int = 15
+    DEFAULT_CONSISTENCY_RAMPUP: int = 40
     DEFAULT_MAX_CONSISTENCY_WEIGHT: float = 0.1
     
     DEFAULT_SKIP_DISTILL_WEIGHT: float = 0.5
@@ -102,7 +102,7 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
     DEFAULT_BOUNDARY_WEIGHT: float = 0.4
     DEFAULT_AUX_WEIGHT: float = 0.4
     
-    DEFAULT_ENABLE_PROTOTYPE: bool = False
+    DEFAULT_ENABLE_PROTOTYPE: bool = True
     DEFAULT_PROJECTION_DIM: int = 128
     DEFAULT_NUM_PROTOTYPES_PER_CLASS: int = 5
     DEFAULT_PROTOTYPE_MOMENTUM: float = 0.9
@@ -127,7 +127,7 @@ class nnUNetTrainerUMambaSDG_MeanTeacher(nnUNetTrainerUMambaSDG):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         
         self.batch_size = 12
-        self.initial_lr = 0.001
+        self.initial_lr = 0.005
         
         self.unlabeled_batch_iter = None
         self.weak_transforms = None
