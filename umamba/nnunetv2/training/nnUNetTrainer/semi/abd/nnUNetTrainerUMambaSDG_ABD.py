@@ -190,6 +190,21 @@ class nnUNetTrainerUMambaSDG_ABD(nnUNetTrainerUMambaSDG):
         print(f"📊 Top num: {self.top_num}")
         print(f"📊 Initial LR: {self.initial_lr}")
     
+    def _prepare_seg_target(self, target):
+        """
+        统一把标签整理成 [B, H, W] long tensor
+        """
+        if isinstance(target, list):
+            target = target[0]
+
+        if target.ndim == 4 and target.shape[1] == 1:
+            target = target[:, 0]
+
+        if target.ndim != 3:
+            raise ValueError(f"Expected target shape [B,H,W] or [B,1,H,W], got {tuple(target.shape)}")
+
+        return target.long().contiguous()
+    
     @staticmethod
     def build_network_architecture(
         plans_manager: PlansManager,
@@ -201,58 +216,57 @@ class nnUNetTrainerUMambaSDG_ABD(nnUNetTrainerUMambaSDG):
     ) -> nn.Module:
         """
         构建双分支网络
-        
         两个分支都是 UMambaSDG，参数独立
+        这里强制关闭 deep supervision，避免 ABD 训练时 target/output 语义混乱
         """
         skip_modes = nnUNetTrainerUMambaSDG.DEFAULT_SKIP_MODES
         enable_aux_head = nnUNetTrainerUMambaSDG.DEFAULT_ENABLE_AUX_HEAD
         aux_head_stage = nnUNetTrainerUMambaSDG.DEFAULT_AUX_HEAD_STAGE
         enable_adaptive_upsample = nnUNetTrainerUMambaSDG.DEFAULT_ENABLE_ADAPTIVE_UPSAMPLE
-        
+
+        force_deep_supervision = False
+
         if len(configuration_manager.patch_size) == 2:
             branch1 = get_umamba_bot_2d_from_plans(
                 plans_manager,
                 dataset_json,
                 configuration_manager,
                 num_input_channels,
-                deep_supervision=enable_deep_supervision,
+                deep_supervision=force_deep_supervision,
                 enable_sdg=True,
                 skip_modes=skip_modes,
                 enable_aux_head=enable_aux_head,
                 aux_head_stage=aux_head_stage,
                 enable_adaptive_upsample=enable_adaptive_upsample
             )
-            
+
             branch2 = get_umamba_bot_2d_from_plans(
                 plans_manager,
                 dataset_json,
                 configuration_manager,
                 num_input_channels,
-                deep_supervision=enable_deep_supervision,
+                deep_supervision=force_deep_supervision,
                 enable_sdg=True,
                 skip_modes=skip_modes,
                 enable_aux_head=enable_aux_head,
                 aux_head_stage=aux_head_stage,
                 enable_adaptive_upsample=enable_adaptive_upsample
             )
-            
+
             model = ABDDualBranchWrapper(
                 branch1,
                 branch2,
                 enable_aux_head=enable_aux_head,
-                enable_deep_supervision=enable_deep_supervision
+                enable_deep_supervision=force_deep_supervision
             )
         else:
             raise NotImplementedError("ABD only supports 2D models currently")
-        
-        print("🚀🚀🚀 [ABD Mode] Dual UMambaSDG with ABD mechanism ENABLED! 🚀🚀🚀")
-        print(f"📋 Branch1: UMambaSDG with skip_modes={skip_modes}")
-        print(f"📋 Branch2: UMambaSDG with skip_modes={skip_modes}")
-        print(f"🔧 enable_aux_head: {enable_aux_head}, aux_head_stage: {aux_head_stage}")
-        print(f"🔄 enable_adaptive_upsample: {enable_adaptive_upsample}")
-        
+
+        print(" [ABD Mode] Dual UMambaSDG with ABD mechanism ENABLED! ")
+        print(" [ABD Fix] Deep supervision forced OFF for stable semi-supervised training.")
         return model
-    
+
+
     def set_deep_supervision_enabled(self, enabled: bool):
         """
         设置深度监督开关
@@ -458,163 +472,100 @@ class nnUNetTrainerUMambaSDG_ABD(nnUNetTrainerUMambaSDG):
     
     def train_step(self, batch: dict, accumulation_step: int = 0) -> dict:
         """
-        ABD 训练步骤
-        
-        1. 获取 labeled 和 unlabeled batch
-        2. branch1 和 branch2 分别前向
-        3. 计算监督损失 (labeled)
-        4. 计算 Cross Teaching 伪标签损失
-        5. ABD-I: 标注样本 Patch 位移
-        6. ABD-R: 无标注样本置信度引导 Patch 位移
-        7. 总损失反向传播
+        修复版 train_step:
+        1. labeled supervised loss
+        2. unlabeled cross teaching loss
+        3. 暂时关闭 ABD-I / ABD-R，先保证训练逻辑正确且稳定
         """
         labeled_batch = batch['labeled']
         unlabeled_batch = batch['unlabeled']
-        
+
         data_labeled = labeled_batch['data']
         target_labeled = labeled_batch['target']
-        
+        data_unlabeled = unlabeled_batch['data']
+
+        if isinstance(data_labeled, np.ndarray):
+            data_labeled = torch.from_numpy(data_labeled)
         data_labeled = data_labeled.to(self.device, non_blocking=True)
+
         if isinstance(target_labeled, list):
             target_labeled = [t.to(self.device, non_blocking=True) for t in target_labeled]
         else:
             target_labeled = target_labeled.to(self.device, non_blocking=True)
-        
-        data_unlabeled = unlabeled_batch['data']
+
         if isinstance(data_unlabeled, np.ndarray):
             data_unlabeled = torch.from_numpy(data_unlabeled)
         data_unlabeled = data_unlabeled.to(self.device, non_blocking=True)
-        
-        if isinstance(target_labeled, list):
-            target_for_loss = target_labeled[0]
-        else:
-            target_for_loss = target_labeled
-        
-        if target_for_loss.ndim == 4 and target_for_loss.shape[1] == 1:
-            target_for_loss = target_for_loss[:, 0]
-        
+
+        target_for_loss = self._prepare_seg_target(target_labeled)
         labeled_bs = data_labeled.shape[0]
-        
+
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else contextlib.nullcontext():
             output1_labeled = self.network(data_labeled, branch='branch1')
             output2_labeled = self.network(data_labeled, branch='branch2')
-            
             output1_unlabeled = self.network(data_unlabeled, branch='branch1')
             output2_unlabeled = self.network(data_unlabeled, branch='branch2')
-            
+
             main_output1_labeled = extract_main_logits(output1_labeled)
             main_output2_labeled = extract_main_logits(output2_labeled)
             main_output1_unlabeled = extract_main_logits(output1_unlabeled)
             main_output2_unlabeled = extract_main_logits(output2_unlabeled)
-            
-            outputs1_max = get_confidence_map(main_output1_labeled)
-            outputs2_max = get_confidence_map(main_output2_labeled)
-            
-            if data_unlabeled.shape[0] > 0:
-                outputs1_max_unlabel = get_confidence_map(main_output1_unlabeled)
-                outputs2_max_unlabel = get_confidence_map(main_output2_unlabeled)
-                outputs1_max = torch.cat([outputs1_max, outputs1_max_unlabel], dim=0)
-                outputs2_max = torch.cat([outputs2_max, outputs2_max_unlabel], dim=0)
-            
-            outputs_soft1 = torch.softmax(main_output1_labeled, dim=1)
-            outputs_soft2 = torch.softmax(main_output2_labeled, dim=1)
-            
-            pseudo_outputs1 = torch.argmax(outputs_soft1.detach(), dim=1)
-            pseudo_outputs2 = torch.argmax(outputs_soft2.detach(), dim=1)
-            
-            loss1 = compute_supervised_loss(main_output1_labeled[:labeled_bs], target_for_loss[:labeled_bs], self.ce_loss, self.dice_loss)
-            loss2 = compute_supervised_loss(main_output2_labeled[:labeled_bs], target_for_loss[:labeled_bs], self.ce_loss, self.dice_loss)
-            
+
+            loss1 = compute_supervised_loss(
+                main_output1_labeled, target_for_loss, self.ce_loss, self.dice_loss
+            )
+            loss2 = compute_supervised_loss(
+                main_output2_labeled, target_for_loss, self.ce_loss, self.dice_loss
+            )
+
             if main_output1_unlabeled.shape[0] > 0:
-                pseudo_supervision1 = compute_pseudo_supervision_loss(main_output1_labeled[labeled_bs:], pseudo_outputs2[labeled_bs:], self.dice_loss)
-                pseudo_supervision2 = compute_pseudo_supervision_loss(main_output2_labeled[labeled_bs:], pseudo_outputs1[labeled_bs:], self.dice_loss)
+                pseudo_outputs1_u = torch.argmax(
+                    torch.softmax(main_output1_unlabeled.detach(), dim=1), dim=1
+                )
+                pseudo_outputs2_u = torch.argmax(
+                    torch.softmax(main_output2_unlabeled.detach(), dim=1), dim=1
+                )
+
+                pseudo_supervision1 = compute_pseudo_supervision_loss(
+                    main_output1_unlabeled, pseudo_outputs2_u, self.dice_loss
+                )
+                pseudo_supervision2 = compute_pseudo_supervision_loss(
+                    main_output2_unlabeled, pseudo_outputs1_u, self.dice_loss
+                )
             else:
                 pseudo_supervision1 = torch.tensor(0.0, device=self.device)
                 pseudo_supervision2 = torch.tensor(0.0, device=self.device)
-            
-            patch_h, patch_w, h_size, w_size = self.get_patch_params()
+
+            # 暂时关闭 ABD-I / ABD-R
+            loss3 = torch.tensor(0.0, device=self.device)
+            loss4 = torch.tensor(0.0, device=self.device)
+            pseudo_supervision3 = torch.tensor(0.0, device=self.device)
+            pseudo_supervision4 = torch.tensor(0.0, device=self.device)
+
             consistency_weight = self.get_current_consistency_weight()
-            
-            total_iterations = self.num_epochs * self.num_iterations_per_epoch
-            disable_abd_i_after = int(total_iterations * self.disable_abd_i_ratio)
-            
-            if self.global_step < disable_abd_i_after and labeled_bs > 0:
-                image_patch_supervised, label_patch_supervised = ABD_I(
-                    outputs1_max, outputs2_max,
-                    data_labeled, data_labeled,
-                    target_for_loss, target_for_loss,
-                    labeled_bs,
-                    patch_h=patch_h,
-                    patch_w=patch_w,
-                    h_size=h_size,
-                    w_size=w_size
-                )
-                
-                image_output_supervised_1 = self.network(image_patch_supervised.unsqueeze(1), branch='branch1')
-                image_output_supervised_2 = self.network(image_patch_supervised.unsqueeze(1), branch='branch2')
-                
-                image_output_supervised_1 = extract_main_logits(image_output_supervised_1)
-                image_output_supervised_2 = extract_main_logits(image_output_supervised_2)
-                
-                loss3 = compute_supervised_loss(image_output_supervised_1, label_patch_supervised, self.ce_loss, self.dice_loss)
-                loss4 = compute_supervised_loss(image_output_supervised_2, label_patch_supervised, self.ce_loss, self.dice_loss)
-            else:
-                loss3 = torch.tensor(0.0, device=self.device)
-                loss4 = torch.tensor(0.0, device=self.device)
-            
-            if main_output1_unlabeled.shape[0] > 0 and self.global_step < disable_abd_i_after:
-                image_patch_unlabeled = ABD_R(
-                    outputs1_max, outputs2_max,
-                    data_labeled, data_labeled,
-                    main_output1_labeled, main_output2_labeled,
-                    labeled_bs,
-                    patch_h=patch_h,
-                    patch_w=patch_w,
-                    h_size=h_size,
-                    w_size=w_size,
-                    top_num=self.top_num
-                )
-                
-                image_output_1 = self.network(image_patch_unlabeled.unsqueeze(1), branch='branch1')
-                image_output_2 = self.network(image_patch_unlabeled.unsqueeze(1), branch='branch2')
-                
-                image_output_1 = extract_main_logits(image_output_1)
-                image_output_2 = extract_main_logits(image_output_2)
-                
-                image_output_soft_1 = torch.softmax(image_output_1, dim=1)
-                image_output_soft_2 = torch.softmax(image_output_2, dim=1)
-                
-                pseudo_image_output_1 = torch.argmax(image_output_soft_1.detach(), dim=1)
-                pseudo_image_output_2 = torch.argmax(image_output_soft_2.detach(), dim=1)
-                
-                pseudo_supervision3 = compute_pseudo_supervision_loss(image_output_1, pseudo_image_output_2, self.dice_loss)
-                pseudo_supervision4 = compute_pseudo_supervision_loss(image_output_2, pseudo_image_output_1, self.dice_loss)
-            else:
-                pseudo_supervision3 = torch.tensor(0.0, device=self.device)
-                pseudo_supervision4 = torch.tensor(0.0, device=self.device)
-            
-            model1_loss = loss1 + 2 * loss3 + consistency_weight * (pseudo_supervision1 + pseudo_supervision3)
-            model2_loss = loss2 + 2 * loss4 + consistency_weight * (pseudo_supervision2 + pseudo_supervision4)
+
+            model1_loss = loss1 + consistency_weight * pseudo_supervision1
+            model2_loss = loss2 + consistency_weight * pseudo_supervision2
             total_loss = model1_loss + model2_loss
-            
-            total_loss = total_loss / self.gradient_accumulation_steps
-        
+
+        total_loss = total_loss / self.gradient_accumulation_steps
+
         if self.grad_scaler is not None:
             self.grad_scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
-        
+
         is_accumulation_step = (accumulation_step + 1) % self.gradient_accumulation_steps != 0
-        
         if not is_accumulation_step:
             if self.grad_scaler is not None:
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
             else:
                 self.optimizer.step()
+
             self.optimizer.zero_grad()
             self.global_step += 1
-        
+
         log_dict = {
             'loss': total_loss.detach().cpu().numpy() * self.gradient_accumulation_steps,
             'loss_branch1': model1_loss.detach().cpu().numpy(),
@@ -622,7 +573,7 @@ class nnUNetTrainerUMambaSDG_ABD(nnUNetTrainerUMambaSDG):
             'loss_pseudo': (pseudo_supervision1 + pseudo_supervision2).detach().cpu().numpy(),
             'consistency_weight': consistency_weight
         }
-        
+
         return log_dict
     
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -695,6 +646,10 @@ class nnUNetTrainerUMambaSDG_ABD(nnUNetTrainerUMambaSDG):
                 self.on_validation_epoch_end(val_outputs)
             
             self.on_epoch_end()
+            
+            if self._early_stop:
+                self.print_to_log_file(f"Early stopping at epoch {self.current_epoch}")
+                break
         
         self.on_train_end()
     
